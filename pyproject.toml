@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gassets-gtr"
+dynamic = ["version"]
+description = "Local reconstruction of Telegram Desktop exports for Windows"
+requires-python = ">=3.12"
+authors = [{name = "Gruzin"}]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "licenses/*.txt"]
+dependencies = [
+    "beautifulsoup4>=4.12,<5",
+    "PySide6-Essentials>=6.8,<7",
+    "tzdata>=2024.1",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[project.urls]
+Repository = "https://github.com/Spalov/gTR"
+Releases = "https://github.com/Spalov/gTR/releases"
+
+[project.optional-dependencies]
+owner = ["Telethon>=1.40,<2"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+gtr = "gtr.cli:main"
+
+[tool.setuptools]
+packages = ["gtr"]
+
+[tool.setuptools.dynamic]
+version = {attr = "gtr.DISTRIBUTION_VERSION"}
+
+[tool.setuptools.package-data]
+gtr = ["assets/gtr.ico", "assets/cat.png", "assets/export-guide.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"

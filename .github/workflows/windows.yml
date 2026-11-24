@@ -1,0 +1,16 @@
+name: Offline Windows tests
+on: [push, pull_request]
+jobs:
+  windows:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.10'
+          architecture: x64
+      - run: python -m pip install -r requirements-win64.txt
+      - run: python -m ruff check --isolated gtr tests packaging
+      - run: python -m pytest --tb=short
+      - run: python -m gtr --version
+      - run: python packaging/build_release.py --archives-only
