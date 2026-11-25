@@ -1,3 +1,5 @@
+![gTR — Gruzin’s Telegram Recovery](https://raw.githubusercontent.com/Spalov/gTR/main/docs/assets/gtr-banner.png)
+
 # gTR
 
 **Beta 4 · Грузин · Windows 10/11 x64**
