@@ -128,11 +128,17 @@ class TelegramAPI:
                         w=details["width"],
                         h=details["height"],
                         round_message=details["round"],
+                        supports_streaming=details.get("supports_streaming") or None,
+                        nosound=details.get("nosound") or None,
+                        video_codec=details.get("video_codec"),
                     )
                 )
             case "audio":
                 attributes.append(
-                    self.types.DocumentAttributeAudio(duration=details["duration"], voice=details["voice"])
+                    self.types.DocumentAttributeAudio(
+                        duration=details["duration"], voice=details["voice"],
+                        title=details.get("title"), performer=details.get("performer"),
+                    )
                 )
             case "animation":
                 attributes.append(self.types.DocumentAttributeAnimated())
@@ -147,6 +153,7 @@ class TelegramAPI:
             mime_type=item["mime"],
             attributes=attributes,
             force_file=item.get("force_file", item["kind"] in {"document", "contact", "location"}),
+            nosound_video=True if details.get("type") == "video" and details.get("nosound") else None,
         )
 
     async def upload_media(self, peer, import_id, item, path):
@@ -185,6 +192,16 @@ class TelegramAPI:
             and isinstance(result.document, self.types.Document)
         ):
             raise ImportFault("MEDIA_INVALID", response_constructor=constructor)
+        from .video import VIDEO_KINDS, observed_media_kind
+
+        actual = observed_media_kind(result)
+        if on_response := getattr(stage, "response", None):
+            on_response(actual)
+        if (
+            item.get("attributes", {}).get("type") == "video"
+            and item["kind"] in VIDEO_KINDS and actual != item["kind"]
+        ):
+            raise ImportFault("MEDIA_TYPE_CHANGED", response_constructor=constructor)
         return constructor
 
     async def start(self, peer, import_id):

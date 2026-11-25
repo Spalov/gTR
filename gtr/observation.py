@@ -9,6 +9,7 @@ from pathlib import Path
 from .faults import ImportFault
 from .files import local, publish_text, read_json
 from .model import RecoveryError, quiet
+from .video import observed_media_kind
 
 MAX_SCAN = 20_000
 MAX_MEDIA_HASH = 128 * 1024**2
@@ -107,6 +108,7 @@ class ObservedMessage:
     media_probe_scope: str = "none"
     document_name: str | None = None
     document_mime: str | None = None
+    media_kind: str | None = None
 
 
 async def last_id(manager, target, *, bundle=None, path=None, protected=()):
@@ -287,6 +289,7 @@ async def capture(manager, target, bundle, window: CaptureWindow, progress=quiet
                 media_probe_scope=scope,
                 document_name=filename,
                 document_mime=getattr(document, "mime_type", None),
+                media_kind=observed_media_kind(media),
             )
             observations.append(asdict(item))
         observations.reverse()

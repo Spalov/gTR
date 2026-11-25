@@ -141,9 +141,10 @@ def test_invalid_time_and_identity_evidence(tmp_path):
     p = analyze(src, tmp_path / "p")
     b = prepare(p, 1, tmp_path / "b", date_policy="ordered")
     assert (
-        b.data["included"] == 2
+        b.data["included"] == 1
         and b.data["losses"]["identity"] == 1
-        and b.data["losses"]["synthetic_time"] == 1
+        and b.data["losses"]["date"] == 1
+        and "synthetic_time" not in b.data["losses"]
     )
     with catalogue(p) as db:
         raw = db.execute("SELECT sender,date_raw,meta FROM messages WHERE source_id='1'").fetchone()

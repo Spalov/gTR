@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sqlite3
 from collections import Counter
 from contextlib import contextmanager
@@ -27,11 +28,12 @@ CREATE TABLE messages (id INTEGER PRIMARY KEY, chat INTEGER REFERENCES chats, so
   conflict INTEGER DEFAULT 0, meta TEXT);
 CREATE UNIQUE INDEX source_identity ON messages(chat,source_id) WHERE source_id <> '';
 CREATE INDEX chronology ON messages(chat,epoch,id);
+CREATE INDEX source_order ON messages(chat,id);
 CREATE TABLE assets (id INTEGER PRIMARY KEY, msg INTEGER REFERENCES messages, kind TEXT, original TEXT,
   path TEXT, status TEXT, expected_size INTEGER, expected_mime TEXT);
 CREATE INDEX assets_by_message ON assets(msg);
 CREATE TABLE issues (chat INTEGER REFERENCES chats, msg INTEGER REFERENCES messages, level TEXT, code TEXT);
-CREATE INDEX issues_by_message ON issues(msg);
+CREATE INDEX issues_by_message ON issues(msg,code);
 CREATE TABLE duplicates (chat INTEGER REFERENCES chats, msg INTEGER REFERENCES messages, identical INTEGER,
   extra_record TEXT);
 PRAGMA user_version=1;
@@ -79,7 +81,8 @@ ERRORS = {
 
 
 def encode(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    data = json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return re.sub(r"[\ud800-\udfff]", lambda match: f"\\u{ord(match[0]):04x}", data)
 
 
 def reconstruct(db, chats, snap, progress):
@@ -99,25 +102,28 @@ def reconstruct(db, chats, snap, progress):
         if chat.peer_key:
             db.execute("INSERT INTO properties VALUES (?,?)", (f"chat_peer:{cid}", chat.peer_key))
         if chat.peer_key and chat.messages:
-            peer_chats.setdefault((chat.messages[0].source, chat.peer_key), []).append(cid)
+            peer_chats.setdefault((chat.source, chat.peer_key), []).append(cid)
         fingerprints = {}
         for ordinal, m in enumerate(chat.messages, 1):
             if count % 100 == 0:
                 progress("reconstruct", count, total)
             count += 1
-            record = asdict(m)
-            record["source_ordinal"] = ordinal
-            content = {k: v for k, v in record.items() if k not in {"source", "flags"}}
-            content.pop("source_ordinal")
-            content["meta"] = {
-                k: v
-                for k, v in m.meta.items()
-                if k not in {"joined", "identity_basis", "reply_href", "date_evidence"}
-            }
-            signature = hashlib.sha256(encode(content).encode()).digest()
+            signature = None
+            if m.source_id:
+                content = {
+                    "author": (m.sender, m.sender_key), "date": (m.date_raw, m.date_iso), "text": m.text,
+                    "rich": m.rich, "reply": (m.reply, m.reply_peer), "service": m.service,
+                    "assets": [asdict(asset) for asset in m.assets],
+                    "meta": {
+                        k: v for k, v in m.meta.items()
+                        if k not in {"joined", "identity_basis", "reply_href", "date_evidence", "historical_time"}
+                    },
+                }
+                signature = hashlib.sha256(encode(content).encode()).digest()
             if m.source_id and m.source_id in fingerprints:
                 orig, prior = fingerprints[m.source_id]
                 same = prior == signature
+                record = {**asdict(m), "source_ordinal": ordinal}
                 db.execute("INSERT INTO duplicates VALUES (?,?,?,?)", (cid, orig, same, encode(record)))
                 db.execute(
                     "INSERT INTO issues VALUES (?,?,?,?)",
@@ -196,7 +202,7 @@ def analyze(source: Path, dest: Path, timezone_name="UTC", progress=quiet, *, ex
         else:
             snap = snapshot(source, work / "source", progress)
             sources = discover(snap)
-        chats = parse(snap, timezone_name, progress, export_format=export_format, sources=sources)
+        chats = parse(snap, timezone_name, progress, export_format=export_format, sources=sources, stream=True)
         formats = [fmt for fmt, group in zip(("html", "json"), sources) if group]
         db = sqlite3.connect(work / "history.sqlite")
         try:

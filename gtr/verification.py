@@ -24,6 +24,7 @@ FIELD_NAMES = {
     "document_name": "Имя документа на сервере",
     "document_mime": "Тип документа на сервере",
     "media_type": "Вид вложения на сервере",
+    "media_kind": "Фактическое представление вложения",
     "reply": "Связь ответа",
     "date": "Историческая дата в метаданных",
     "wire_date": "Дата из плана в метаданных",
@@ -347,6 +348,11 @@ def _view(expected, capture, authors, zone, media_hashes, media):
                 got.get("media_constructor"),
                 ("MessageMediaDocument" if is_document else "MessageMediaPhoto") if has else None,
             ),
+            "media_kind": (
+                got.get("media_kind"),
+                (attachment.get("kind") if attachment.get("attributes") or not is_document else "document")
+                if has else None,
+            ),
             "reply": (got.get("reply_to_id") or 0, reply_id),
             "date": (_stamp(got.get("original_date")), original),
             "wire_date": (_stamp(got.get("original_date")), _wire(want, zone)),
@@ -371,7 +377,7 @@ def _view(expected, capture, authors, zone, media_hashes, media):
             seen.add(i)
             if marks["date"] == marks["label"] == marks["attachment"] == "same" and all(
                 marks[k] != "different"
-                for k in ("document_name", "document_mime", "media_type", "media_bytes")
+                for k in ("document_name", "document_mime", "media_type", "media_kind", "media_bytes")
             ):
                 present.add(want["source_ordinal"])
             if all(marks[key] == "same" for key in VISUAL_FIELDS):
@@ -384,6 +390,9 @@ def _view(expected, capture, authors, zone, media_hashes, media):
             {
                 "source_id": want["source_id"],
                 "ordinal": i,
+                "fields": marks,
+                "media_kind": got.get("media_kind"),
+                "document_name": got.get("document_name"),
                 "mapped_telegram_peer_id": identity,
                 "imported_message_id": got["id"],
                 "imported_sender_id": server_id,
@@ -400,7 +409,7 @@ def _view(expected, capture, authors, zone, media_hashes, media):
                 "media_probe_scope": got.get("media_probe_scope", "none"),
                 "media_bytes": marks["media_bytes"],
                 "verification_status": "differences"
-                if any(marks[key] == "different" for key in (*SERVER_FIELDS, *VISUAL_FIELDS))
+                if any(marks[key] == "different" for key in (*SERVER_FIELDS, *VISUAL_FIELDS, "media_kind"))
                 else "unknown"
                 if any(marks[key] == "unknown" for key in (*SERVER_FIELDS, *VISUAL_FIELDS))
                 else "verified",
@@ -476,7 +485,7 @@ def compare(bundle, first, second=None, mapping=None, *, project=None, progress=
     if complete_read and any(
         v["metrics"][k].get("different")
         for v in views
-        for k in ("document_name", "document_mime", "media_type")
+        for k in ("document_name", "document_mime", "media_type", "media_kind")
     ):
         server = "differences"
     if (

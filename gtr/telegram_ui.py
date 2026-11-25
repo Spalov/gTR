@@ -82,6 +82,7 @@ ACTION = {
     "password": "Двухэтапная проверка",
     "remember": "Сохранение сессии",
     "profile": "Чтение карточки аккаунта",
+    "forward_names": "Чтение имён по открытым ID",
     "disconnect": "Отключение",
     "dialogs": "Список диалогов",
     "preflight": "Проверка пакета и цели",
@@ -1150,6 +1151,8 @@ class TelegramControls(QObject):
             self.request_profile()
         elif name == "profile" and self.account:
             self.show_profile(result)
+        elif name == "forward_names" and self.account:
+            self.window.show_forward_names(result)
         elif name == "dialogs":
             self.target.clear()
             self.dialog_preview.clear()

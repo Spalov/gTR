@@ -11,6 +11,8 @@ from .filenames import assign_names
 from .history import HistoricalIdentity, ordered_rows
 from .model import quiet
 from .payloads import plan_media
+from .structure import annotated_text, historical_notes
+from .video import VIDEO_KINDS, video_representation
 
 
 def _count(db, sql, values):
@@ -27,6 +29,8 @@ def _payload_matches(bundle, actual, expected):
             actual["size"] == expected["size"]
             and actual["sha256"] == expected["sha256"]
             and actual.get("attributes", {}) == expected.get("attributes", {})
+            and actual.get("transform") == expected.get("transform")
+            and actual.get("force_file", False) == expected.get("force_file", False)
         )
     listed = actual.get("members", [])
     if len(listed) != len(expected["members"]):
@@ -120,8 +124,10 @@ def check_local(bundle, project: Path | None, progress=quiet) -> dict:
                 ):
                     differences.append({"code": "source_date", "ordinal": i})
                 sha = hashlib.sha256(original["text"].encode()).hexdigest()
-                if sha != record["original_text_sha256"] or (
-                    record["included"] and sha != record["text_sha256"]
+                notes = historical_notes(meta) if bundle.data.get("annotate") and record["included"] else {}
+                wire_sha = hashlib.sha256(annotated_text(original["text"], notes).encode()).hexdigest()
+                if sha != record["original_text_sha256"] or notes != record.get("annotations", {}) or (
+                    record["included"] and wire_sha != record["text_sha256"]
                 ):
                     differences.append({"code": "source_text", "ordinal": i})
                 resolved = original["resolved_reply"] if original["resolved_reply_chat"] == chat else None
@@ -146,9 +152,29 @@ def check_local(bundle, project: Path | None, progress=quiet) -> dict:
                 if record["included"]:
                     payload = None
                     if mode != "text_only":
+                        policy = bundle.data.get("video_policy")
+                        decision = record.get("video_recovery")
+                        group_skip = decision and decision.get("scope") == "group" and policy == "skip"
                         payload = plan_media(
-                            files, meta, asset_ordinal + 1, [], documents_only=mode == "document"
+                            [item for item in files if item["kind"] not in VIDEO_KINDS] if group_skip else files,
+                            meta, asset_ordinal + 1, [], documents_only=mode == "document",
+                            missing_references=policy is None,
                         )
+                        if policy and mode == "text_media" and payload and payload["kind"] in {"audio", "voice"}:
+                            audio = record.get("audio_recovery", {})
+                            if audio.get("attributes"):
+                                payload.update(attributes=audio["attributes"], representation="specialized_document")
+                            elif audio.get("status") == "audio_unreadable":
+                                payload = None
+                        if payload and payload["kind"] in VIDEO_KINDS and policy and mode == "text_media":
+                            if (
+                                not isinstance(decision, dict)
+                                or decision.get("original_sha256") != payload["sha256"]
+                                or decision.get("action") not in {"keep", "convert", "document", "skip"}
+                            ):
+                                differences.append({"code": "video_provenance", "ordinal": i})
+                            else:
+                                payload = video_representation(payload, decision)
                         if payload and bundle.data.get("filename_version"):
                             assign_names(payload, meta, used_names)
                     elif not original["text"].strip():

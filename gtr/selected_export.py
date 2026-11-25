@@ -22,7 +22,7 @@ def selected_snapshot(source, destination, timezone_name, progress):
         sources = ({}, names[:])
     inventory = {name: FileInfo((root / name).stat().st_size, "", "", False) for name in names}
     draft = Snapshot(root, inventory, "", 0, kind)
-    rows = parse(draft, timezone_name, progress, export_format=kind, sources=sources)
+    rows = parse(draft, timezone_name, progress, export_format=kind, sources=sources, stream=True)
     referenced = set(names)
     for chat in rows:
         for message in chat.messages:

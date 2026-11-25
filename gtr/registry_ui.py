@@ -101,6 +101,11 @@ class ProfilesPage(QWidget):
         form = QFormLayout(self.options)
         form.addRow("Диалог из архива", self.chat)
         form.addRow("Включить в пакет", self.mode)
+        self.video = QComboBox()
+        self.video.setModel(window.import_video.model())
+        self.notes = window.notes_checkbox()
+        form.addRow("Видео", self.video)
+        form.addRow(self.notes)
         form.addRow("Первая запись", self.first)
         form.addRow("Последняя запись", self.last)
         form.addRow(self.verify_previous)
@@ -145,6 +150,8 @@ class ProfilesPage(QWidget):
         for signal in (
             self.chat.currentIndexChanged,
             self.mode.currentIndexChanged,
+            self.video.currentIndexChanged,
+            self.notes.toggled,
             self.first.valueChanged,
             self.last.valueChanged,
         ):
@@ -306,6 +313,8 @@ class ProfilesPage(QWidget):
             self.last.value() or None,
             self.verify_previous.isChecked(),
             self.test_mode.isChecked(),
+            self.video.currentData(),
+            self.notes.isChecked(),
         )
 
     def changed(self, *_):
@@ -327,7 +336,7 @@ class ProfilesPage(QWidget):
         if self.window.worker or self.window.telegram.busy:
             self.timer.start()
             return
-        account, _, project, chat, mode, first, last, verify_previous, test_mode = key
+        account, _, project, chat, mode, first, last, verify_previous, test_mode, _, _ = key
         p = self.choice.currentData()
 
         def job(progress):
@@ -387,7 +396,8 @@ class ProfilesPage(QWidget):
         if not self.preview or self.key() != self.ready_key:
             return
         key = self.ready_key
-        account, peer, project, chat, mode, first, last, _, _ = key
+        account, peer, project, chat, mode, first, last, _, _, policy, annotate = key
+        video = self.window.video_options(policy, annotate=annotate)
         expected = self.preview[1].eligible
         test_reset_id = self.preview[3]
         p = self.choice.currentData()
@@ -411,6 +421,7 @@ class ProfilesPage(QWidget):
                 media_mode=mode,
                 record_ranges=expected,
                 test_reset_id=test_reset_id,
+                **video,
             )
             if (
                 check_local(package, project, progress)["status"] != "verified"

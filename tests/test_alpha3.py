@@ -37,9 +37,9 @@ def test_historical_plan_keeps_ties_offset_and_source_order(tmp_path):
     h, a = (load_bundle(b.root).data for b in (historical, alternative))
     assert [row["source_id"] for row in h["records"]] == [str(i) for i in range(1, 6)]
     assert [row["import_date"][-2:] for row in h["records"]] == ["04", "04", "05", "03", "08"]
-    assert [row["import_date"][-2:] for row in a["records"]] == ["04", "05", "06", "07", "08"]
+    assert [r["import_date"] for r in a["records"]] == [r["import_date"] for r in h["records"]]
     assert h["timeline"] == {"equal": 1, "regression": 1, "cascade": 0, "max_shift_seconds": 0}
-    assert a["timeline"]["cascade"] == 1 and a["losses"]["ordered_time"] == 3
+    assert a["timeline"] == h["timeline"] and "ordered_time" not in a["losses"]
     first = h["records"][0]
     assert first["source_identity"]["original_timezone"] == "+03:00"
     assert first["source_identity"]["original_author_id"] == "user10"
@@ -47,9 +47,14 @@ def test_historical_plan_keeps_ties_offset_and_source_order(tmp_path):
     assert (source / "result.json").read_bytes() == original
 
 
-def test_old_ordered_package_is_still_readable(project, tmp_path):
-    prepared = prepare(project, 1, tmp_path / "bundle2", date_policy="ordered")
-    old = {**prepared.data, "schema": 2}
+def test_old_ordered_package_is_still_readable(tmp_path):
+    source = write_json(tmp_path / "source", [
+        message(1, "A"),
+        message(2, "B", date="2025-01-02T10:04:06+02:00"),
+    ])
+    project = analyze(source, tmp_path / "project")
+    prepared = prepare(project, 1, tmp_path / "bundle2", "UTC")
+    old = {**prepared.data, "schema": 2, "date_policy": "ordered"}
     (prepared.root / "manifest.json").write_text(json.dumps(old), encoding="utf-8")
     bundle = load_bundle(prepared.root)
     assert bundle.data["schema"] == 2 and check_local(bundle, project)["status"] == "unknown"

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from .core import ISSUES, catalogue
 from .dashboard import label, number, size_text
+from .i18n import tr
 from .identity import participants
 from .media import KIND_NAMES
 
@@ -45,7 +46,7 @@ def fill(widget, rows, description):
 
 
 class Library(QWidget):
-    def __init__(self, open_asset, jump, inspect_media=None, export_media=None):
+    def __init__(self, open_asset, jump, inspect_media=None, export_media=None, gallery=None):
         super().__init__()
         self.project = None
         self.offset = 0
@@ -91,6 +92,10 @@ class Library(QWidget):
             self.save_inspection.clicked.connect(lambda: export_media(self.report))
             tools.addWidget(audit)
             tools.addWidget(self.save_inspection)
+            if gallery:
+                photos = QPushButton(tr("Галерея фотографий"))
+                photos.clicked.connect(lambda: gallery(self.chat.currentData()))
+                tools.addWidget(photos)
             tools.addStretch()
             layout.addLayout(tools)
         for signal in (self.chat.currentIndexChanged, self.kind.currentIndexChanged, self.search.textChanged):

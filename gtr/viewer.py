@@ -11,9 +11,11 @@ from zoneinfo import ZoneInfo
 from PySide6.QtCore import QDate, Qt, QUrl
 from PySide6.QtGui import QFontMetrics, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -25,13 +27,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .core import ISSUES, catalogue
-from .files import local, safe_parts
+from .core import ISSUES, catalogue, properties
+from .files import local, publish_text, safe_parts
 from .history import SOURCE_ORDER
+from .i18n import tr
 from .media import KIND_NAMES
 from .media_engine import MEDIA_ISSUES
 from .media_preview import FFmpegThumbnail, preview
 from .model import RecoveryError
+from .structure import forward_from_meta
 
 PAGE_SIZE = 40
 ORDER = SOURCE_ORDER
@@ -44,23 +48,28 @@ class LocalBrowser(QTextBrowser):
 
 
 class Viewer(QWidget):
-    def __init__(self, run_job=None, ffmpeg_path=lambda: ""):
+    def __init__(self, run_job=None, ffmpeg_path=lambda: "", *, forwards=False, resolve=None, jump=None):
         super().__init__()
         self.run_job, self.ffmpeg_path = run_job, ffmpeg_path
         self.project = None
+        self.forwards_only = forwards
+        self.current_names = {}
+        self.page_ids = ()
+        self.resolve = resolve
+        self.jump = jump
         self.offset = 0
         self.zone = ""
         self.chat, self.side = QComboBox(), QComboBox()
         self.chat.setToolTip("Диалог из экспорта")
         self.side.setToolTip("Чьи сообщения показывать справа")
-        self.search = QLineEdit(placeholderText="Поиск по тексту…")
+        self.search = QLineEdit(placeholderText=tr("Поиск по тексту…"))
         self.search.setClearButtonEnabled(True)
         self.browser = LocalBrowser()
         self.browser.setOpenLinks(False)
         self.browser.setOpenExternalLinks(False)
         self.browser.anchorClicked.connect(self.follow)
         self.status = QLabel()
-        self.prev, self.next = QPushButton("← Назад"), QPushButton("Далее →")
+        self.prev, self.next = QPushButton(tr("← Назад")), QPushButton(tr("Далее →"))
         self.prev.clicked.connect(lambda: self.move(-PAGE_SIZE))
         self.next.clicked.connect(lambda: self.move(PAGE_SIZE))
         controls = QHBoxLayout()
@@ -82,17 +91,25 @@ class Viewer(QWidget):
         self.go.clicked.connect(self.jump_day)
         filters = QHBoxLayout()
         filters.addWidget(self.kind)
+        self.author = QComboBox()
+        self.author.setAccessibleName(tr("Все авторы"))
+        filters.addWidget(self.author)
+        self.forward_filter = QCheckBox(tr("Только пересланные"))
+        self.forward_filter.setChecked(forwards)
+        if not forwards:
+            filters.addWidget(self.forward_filter)
         self.message_id = QLineEdit(placeholderText="ID сообщения")
         self.message_id.setAccessibleName("Исходный ID сообщения")
         self.message_id.setMaximumWidth(135)
         self.message_id.returnPressed.connect(self.jump_id)
         find = QPushButton("К ID")
         find.clicked.connect(self.jump_id)
-        filters.addWidget(self.message_id)
-        filters.addWidget(find)
-        filters.addStretch()
-        filters.addWidget(self.day)
-        filters.addWidget(self.go)
+        jump = QHBoxLayout()
+        jump.addWidget(self.message_id)
+        jump.addWidget(find)
+        jump.addStretch()
+        jump.addWidget(self.day)
+        jump.addWidget(self.go)
         pager = QHBoxLayout()
         pager.addWidget(self.status)
         pager.addStretch()
@@ -102,16 +119,34 @@ class Viewer(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addLayout(controls)
         layout.addLayout(filters)
+        layout.addLayout(jump)
+        if resolve:
+            self.lookup = QPushButton(tr("Обновить имена на этой странице"))
+            self.lookup.clicked.connect(lambda: resolve(self.page_ids))
+            clear = QPushButton(tr("Показать только локальный архив"))
+            clear.clicked.connect(self.clear_names)
+            options = QHBoxLayout()
+            options.addWidget(self.lookup)
+            options.addWidget(clear)
+            options.addStretch()
+            layout.addLayout(options)
+        else:
+            export = QPushButton(tr("Сохранить выбранный фрагмент…"))
+            export.clicked.connect(self.export_fragment)
+            jump.addWidget(export)
         layout.addWidget(self.browser, 1)
         layout.addLayout(pager)
         self.chat.currentIndexChanged.connect(self.load_sides)
         self.side.currentIndexChanged.connect(self.render)
         self.search.textChanged.connect(self.reset_page)
         self.kind.currentIndexChanged.connect(self.reset_page)
+        self.author.currentIndexChanged.connect(self.reset_page)
+        self.forward_filter.toggled.connect(self.reset_page)
         self.render()
 
     def bind(self, project):
         self.project = project
+        self.current_names.clear()
         self.search.blockSignals(True)
         self.search.clear()
         self.search.blockSignals(False)
@@ -131,14 +166,20 @@ class Viewer(QWidget):
             return
         self.side.blockSignals(True)
         self.side.clear()
+        self.author.blockSignals(True)
+        self.author.clear()
+        self.author.addItem(tr("Все авторы"), "")
         with catalogue(self.project) as db:
             for row in db.execute(
                 """SELECT sender_key,min(sender) AS label FROM messages WHERE chat=?
                 AND service=0 AND sender_key<>'' GROUP BY sender_key ORDER BY min(id)""",
                 (self.chat.currentData(),),
             ):
-                self.side.addItem(row["label"] or row["sender_key"], row["sender_key"])
+                title = row["label"] or row["sender_key"]
+                self.side.addItem(title, row["sender_key"])
+                self.author.addItem(title, row["sender_key"])
         self.side.blockSignals(False)
+        self.author.blockSignals(False)
         self.set_date_range()
         self.reset_page()
 
@@ -168,6 +209,16 @@ class Viewer(QWidget):
         if self.search.text():
             clauses.append("instr(casefold(text),?)>0")
             args.append(self.search.text().casefold())
+        if author := self.author.currentData():
+            clauses.append("sender_key=?")
+            args.append(author)
+        if self.forward_filter.isChecked():
+            clauses.append("""(
+                json_extract(meta,'$.forward.is_forwarded')=1
+                OR json_type(meta,'$.forwarded_from') IS NOT NULL
+                OR json_type(meta,'$.forwarded_from_id') IS NOT NULL
+                OR json_type(meta,'$.forward_info') IS NOT NULL
+            )""")
         kind = self.kind.currentData()
         if kind == "text":
             clauses.append(
@@ -242,6 +293,9 @@ class Viewer(QWidget):
     def render(self, *_):
         self.prev.setEnabled(False)
         self.next.setEnabled(False)
+        self.page_ids = ()
+        if self.resolve:
+            self.lookup.setEnabled(False)
         if not self.project or not self.chat.currentData():
             self.browser.setPlainText("Откройте архив, чтобы просмотреть переписку.")
             self.status.clear()
@@ -255,6 +309,12 @@ class Viewer(QWidget):
                 (*args, PAGE_SIZE, self.offset),
             ).fetchall()
             parts, last_day = [], ""
+            self.page_ids = tuple(sorted({
+                identity for row in rows
+                if (identity := forward_from_meta(json.loads(row["meta"])).user_id) is not None
+            }))
+            if self.resolve:
+                self.lookup.setEnabled(bool(self.page_ids))
             for row in rows:
                 moment = datetime.fromisoformat(row["date_iso"]) if row["date_iso"] else None
                 if moment and self.zone:
@@ -285,10 +345,39 @@ class Viewer(QWidget):
         inner = [f'<b style="color:#f4cf91">{escape(row["sender"] or "Автор неизвестен")}</b>']
         widths = [row["sender"], *row["text"].splitlines()[:40]]
         meta = json.loads(row["meta"])
-        if "forwarded_from" in meta:
-            inner.append(
-                f"<small>Переслано · {escape(str(meta['forwarded_from'] or 'источник в экспорте'))}</small>"
-            )
+        forward = forward_from_meta(meta)
+        if forward.is_forwarded:
+            if forward.user_id in self.current_names:
+                forward = forward.resolve(self.current_names)
+            historical = forward.historical_sender_name
+            display = forward.resolved_display_name or historical or tr("Неизвестный отправитель")
+            detail = {
+                "contacts": "Имя из ваших контактов", "public": "Имя в Telegram",
+            }.get(forward.resolution_source)
+            lines = [f"{tr('Переслано от')} · {escape(display)}"]
+            if detail:
+                lines.append(tr(detail))
+            if historical and historical != forward.resolved_display_name:
+                lines.append(f"{tr('Историческое имя')} · {escape(historical)}")
+            if forward.privacy_state in {"hidden", "unavailable"}:
+                lines.append(tr("Профиль скрыт" if forward.privacy_state == "hidden" else "Профиль недоступен"))
+            if forward.original_peer_type != "unknown":
+                lines.append(tr({"user": "Пользователь", "chat": "Группа", "channel": "Канал"}[forward.original_peer_type]))
+            if forward.original_message_date:
+                lines.append(escape(forward.original_message_date))
+            inner.append("<small>" + " · ".join(lines) + "</small>")
+        if meta.get("album_id"):
+            inner.append(f"<small>{tr('Альбом')} · {escape(str(meta['album_id']))}</small>")
+        if quote := meta.get("quote"):
+            inner.append(f"<small>{tr('Цитата')} · {escape(str(quote)[:800])}</small>")
+        if meta.get("edited_available") or meta.get("edited"):
+            edit = meta.get("edited") or meta.get("edit_date") or meta.get("edited_unixtime") or ""
+            inner.append(f"<small>{tr('Редактирование')} · {escape(str(edit))}</small>")
+        if reactions := meta.get("reactions"):
+            labels = [
+                f"{r.get('emoji', '')} × {r.get('count', '—')}" for r in reactions[:24] if isinstance(r, dict)
+            ] if isinstance(reactions, list) else []
+            inner.append(f"<small>{tr('Реакции')} · {escape(' · '.join(labels) or '—')}</small>")
         if row["reply"]:
             target = row["target"]
             if target:
@@ -377,6 +466,9 @@ class Viewer(QWidget):
             QMessageBox.warning(self, "Вложение", "Файл недоступен или изменился после анализа.")
 
     def jump_to(self, chat, mid):
+        if self.jump:
+            self.jump(chat, mid)
+            return
         with catalogue(self.project) as db:
             pos = db.execute(
                 f"""SELECT pos FROM (SELECT id,row_number() OVER (ORDER BY {ORDER})-1 AS pos
@@ -387,9 +479,38 @@ class Viewer(QWidget):
             self.chat.setCurrentIndex(self.chat.findData(chat))
             self.search.clear()
             self.kind.setCurrentIndex(0)
+            self.author.setCurrentIndex(0)
+            self.forward_filter.setChecked(False)
             self.offset = pos[0] // PAGE_SIZE * PAGE_SIZE
             self.render()
             self.browser.scrollToAnchor("m" + str(mid))
+
+    def clear_names(self):
+        if self.current_names:
+            self.current_names.clear()
+            self.render()
+
+    def apply_names(self, ids, names):
+        self.current_names.update(dict.fromkeys(ids))
+        self.current_names.update(names)
+        self.render()
+
+    def export_fragment(self):
+        selection = self.browser.textCursor().selectedText()
+        if not self.project or not selection.strip():
+            QMessageBox.information(self, "gTR", tr("Выделите фрагмент переписки в просмотрщике."))
+            return
+        path, _ = QFileDialog.getSaveFileName(self, tr("Сохранить выбранный фрагмент…"), "gTR-fragment.txt", "*.txt")
+        if path:
+            try:
+                dest = local(Path(path))
+                with catalogue(self.project) as db:
+                    original = local(Path(properties(db)["original"]))
+                if any(dest.is_relative_to(root) for root in (self.project, original)):
+                    raise RecoveryError("Выберите отдельную папку.")
+                publish_text(dest, selection.replace(chr(8233), chr(10)))
+            except (OSError, RecoveryError):
+                QMessageBox.warning(self, "gTR", tr("Выберите новый файл вне исходных данных."))
 
     def show_media(self, entry):
         path = local(self.project.joinpath("source", *safe_parts(entry["path"])))

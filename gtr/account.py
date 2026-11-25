@@ -217,6 +217,33 @@ class AccountManager:
             avatar,
         )
 
+    async def forward_names(self, identities):
+        """Resolve only explicit exported user IDs through authorized reads."""
+        from telethon import functions, types, utils
+
+        self._assert_connected()
+        requested = {identity for identity in identities if type(identity) is int and 0 < identity < 2**63}
+        if not requested or len(requested) > 40:
+            return {}
+
+        contact_list = await self.rpc(self.client(functions.contacts.GetContactsRequest(hash=0)), seconds=12)
+        contacts = {contact.user_id for contact in getattr(contact_list, "contacts", [])}
+        names = {
+            user.id: (utils.get_display_name(user), "contacts")
+            for user in getattr(contact_list, "users", [])
+            if isinstance(user, types.User) and user.id in requested & contacts and not user.deleted
+            and utils.get_display_name(user)
+        }
+        for identity in sorted(requested - names.keys()):
+            try:
+                user = await self.rpc(self.client.get_entity(types.PeerUser(identity)), seconds=6)
+            except (ImportFault, ValueError):
+                continue
+            if (isinstance(user, types.User) and user.id == identity and not user.deleted
+                    and (name := utils.get_display_name(user))):
+                names[identity] = (name, "contacts" if identity in contacts else "public")
+        return names
+
     def session(self) -> str:
         if not self.account or not self.client:
             raise RecoveryError("Сначала войдите в свой аккаунт.")

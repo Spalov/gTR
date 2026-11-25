@@ -2,8 +2,6 @@
 
 import io
 import struct
-import subprocess
-import tempfile
 import wave
 from pathlib import Path
 from typing import Protocol
@@ -11,18 +9,14 @@ from typing import Protocol
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QSize, Qt
 from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPen
 
-from .files import local, private_directory
+from .files import local
 from .media_engine import HEADER_BYTES, PICTURE_TYPES, inspect
 from .model import RecoveryError, quiet
+from .video import DEMUXERS, _input, _run
 
 MAX_PIXELS = 16_000_000
 MAX_FRAME_BYTES = 1024 * 1024
-DEMUXERS = {
-    "video/mp4": "mov",
-    "video/quicktime": "mov",
-    "video/webm": "matroska",
-    "video/x-matroska": "matroska",
-}
+VIDEO_MIME = {mime for mime in DEMUXERS if mime.startswith("video/")}
 
 
 class VideoThumbnailProvider(Protocol):
@@ -38,64 +32,16 @@ class FFmpegThumbnail:
             raise RecoveryError("Выберите установленную программу ffmpeg для локального предпросмотра.")
 
     def frame(self, source: Path, detected_mime: str) -> bytes | None:
-        format_name = DEMUXERS.get(detected_mime)
-        if not format_name:
+        if detected_mime not in VIDEO_MIME:
             return None
         source = local(source)
-        with tempfile.TemporaryDirectory(prefix="gtr-frame-") as tmp:
-            root = Path(tmp)
-            private_directory(root)
-            frame = root / "frame.png"
-            cmd = [
-                str(self.executable),
-                "-nostdin",
-                "-loglevel",
-                "error",
-                "-protocol_whitelist",
-                "file",
-                "-f",
-                format_name,
-                "-threads",
-                "1",
-            ]
-            if format_name == "mov":
-                cmd.extend(("-enable_drefs", "0", "-use_absolute_path", "0"))
-            cmd.extend(
-                (
-                    "-i",
-                    str(source),
-                    "-map",
-                    "0:v:0",
-                    "-an",
-                    "-sn",
-                    "-dn",
-                    "-frames:v",
-                    "1",
-                    "-vf",
-                    "scale=480:300:force_original_aspect_ratio=decrease",
-                    "-threads",
-                    "1",
-                    "-fs",
-                    str(MAX_FRAME_BYTES),
-                    str(frame),
-                )
-            )
-            try:
-                result = subprocess.run(
-                    cmd,
-                    cwd=root,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=12,
-                    check=False,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-                if result.returncode == 0 and frame.is_file() and frame.stat().st_size <= MAX_FRAME_BYTES:
-                    return frame.read_bytes()
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        return None
+        return _run(self.executable, [
+            "-nostdin", "-v", "error", "-threads", "1", *_input(source, detected_mime),
+            "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1", "-filter_threads", "1",
+            "-vf", "scale=480:300:force_original_aspect_ratio=decrease", "-threads", "1",
+            "-vcodec", "png", "-f", "image2pipe", "pipe:1",
+        ], 12, quiet)
+
 
 
 def _scaled_image(reader):
@@ -151,7 +97,7 @@ def preview(path, expected_hash, declared_mime=None, *, provider=None, progress=
         picture = _scaled_image(QImageReader(str(path)))
     elif facts.mime == "audio/wav" and "corrupt_container" not in facts.issues:
         picture = _waveform(path)
-    elif provider and facts.mime in DEMUXERS and "corrupt_container" not in facts.issues:
+    elif provider and facts.mime in VIDEO_MIME and "corrupt_container" not in facts.issues:
         data = provider.frame(path, facts.mime)
         if data and len(data) <= MAX_FRAME_BYTES and data.startswith(b"\x89PNG\r\n\x1a\n"):
             buffer = QBuffer()

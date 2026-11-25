@@ -17,8 +17,8 @@ def test_cli_complete_offline_flow(tmp_path, synthetic, capsys):
     assert json.loads(capsys.readouterr().out)[0]["id"] == 1
     assert main(["verify", str(p)]) == 0
     assert json.loads(capsys.readouterr().out) == {"ok": 9}
-    assert main(["prepare", str(p), "--chat", "1", "--out", str(b)]) == 0
-    assert json.loads(capsys.readouterr().out)["media_count"] == 8
+    assert main(["prepare", str(p), "--chat", "1", "--out", str(b), "--video-policy", "document"]) == 0
+    assert json.loads(capsys.readouterr().out)["media_count"] == 7
     assert main(["simulate", str(b)]) == 0
     assert json.loads(capsys.readouterr().out)["mode"] == "mock"
     assert main(["simulate", str(b), "--scenario", "flood"]) == 2

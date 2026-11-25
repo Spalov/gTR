@@ -839,7 +839,7 @@ class Journal:
     def finish_media(self, job: str, attempt: dict):
         with self.connect(lock=True) as db:
             result = db.execute(
-                """UPDATE media_attempts SET stage=?,ended_at=?,status=?,error_code=?,response_constructor=?
+                """UPDATE media_attempts SET stage=?,ended_at=?,status=?,error_code=?,response_constructor=?,details=?
                 WHERE operation=? AND item_index=? AND status='UPLOADING_ITEM'""",
                 (
                     attempt["stage"],
@@ -847,6 +847,7 @@ class Journal:
                     attempt["status"],
                     attempt["error_code"],
                     attempt["response_constructor"],
+                    json.dumps(attempt, ensure_ascii=False),
                     job,
                     attempt["index"],
                 ),

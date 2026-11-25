@@ -6,7 +6,7 @@ from pathlib import Path
 
 from . import __version__
 from .backup import backup_project
-from .conversion import MEDIA_MODES, load_bundle, plan_import, prepare
+from .conversion import MEDIA_MODES, RECORD_KINDS, load_bundle, plan_import, prepare
 from .core import analyze, catalogue, summary, verify
 from .faults import ImportFault
 from .files import local, publish_text
@@ -15,6 +15,7 @@ from .mock_api import SCENARIOS, rehearse
 from .model import RecoveryError, quiet
 from .reports import plan_summary, redact_verification, save_report
 from .verification import compare_files
+from .video import VIDEO_POLICIES, MediaTools
 
 
 class RussianParser(argparse.ArgumentParser):
@@ -65,8 +66,15 @@ def arguments():
         convert.add_argument("--sample", type=int)
         convert.add_argument("--first-record", type=int, default=1, help="Первый исходный номер записи")
         convert.add_argument("--last-record", type=int, help="Последний исходный номер записи включительно")
+        convert.add_argument("--record-kind", choices=RECORD_KINDS, default="all", help="Выбор типа исходной записи")
         convert.add_argument("--dates", choices=("historical", "ordered"), default="historical")
         convert.add_argument("--media-mode", choices=MEDIA_MODES, default="text_media", help="Режим вложений")
+        convert.add_argument("--video-policy", choices=VIDEO_POLICIES, default="original",
+                             help="Как подготовить видео. compatible разрешает перекодирование копии")
+        convert.add_argument("--ffmpeg", type=Path)
+        convert.add_argument("--ffprobe", type=Path)
+        convert.add_argument("--historical-notes", action="store_true",
+                             help="Вставить отмеченные исторические подписи и цитаты в текст")
     fixture = commands.add_parser("fixture", help="Создать локальный синтетический пакет")
     series = commands.add_parser(
         "fixture-series", help="Создать три синтетических экспорта для проверки продолжения"
@@ -121,6 +129,13 @@ def arguments():
     evidence.add_argument("--out", type=Path)
     evidence.add_argument("--project", type=Path)
     evidence.add_argument("--private", action="store_true", help="Включить частные данные выбранных снимков")
+    fidelity_report = commands.add_parser("fidelity", help="Сверить точность восстановления по сообщениям")
+    fidelity_report.add_argument("bundle", type=Path)
+    fidelity_report.add_argument("captures", type=Path, nargs="*")
+    fidelity_report.add_argument("--mapping", type=Path)
+    fidelity_report.add_argument("--project", type=Path)
+    fidelity_report.add_argument("--out", type=Path)
+    fidelity_report.add_argument("--private", action="store_true", help="Включить локальные даты, ID и имена файлов")
     jobs = commands.add_parser("operations", help="Показать локальный журнал серверных задач")
     jobs.add_argument("--events", metavar="ID")
     diagnostic = commands.add_parser("import-diagnostic", help="Сохранить диагностику по ID операции")
@@ -170,6 +185,10 @@ def main(argv=None):
                 media_mode=args.media_mode,
                 first_record=args.first_record,
                 last_record=args.last_record,
+                video_policy=args.video_policy,
+                media_tools=MediaTools(args.ffmpeg, args.ffprobe),
+                annotate=args.historical_notes,
+                record_kind=args.record_kind,
             )
             result = {
                 k: bundle.data[k]
@@ -208,6 +227,10 @@ def main(argv=None):
                 media_mode=args.media_mode,
                 first_record=args.first_record,
                 last_record=args.last_record,
+                video_policy=args.video_policy,
+                media_tools=MediaTools(args.ffmpeg, args.ffprobe),
+                annotate=args.historical_notes,
+                record_kind=args.record_kind,
             )
             result = plan_summary(data)
             if args.out:
@@ -250,6 +273,22 @@ def main(argv=None):
                 )
             if not args.private:
                 result = redact_verification(result)
+        elif args.command == "fidelity":
+            from .fidelity import fidelity, public_fidelity
+
+            bundle = load_bundle(args.bundle)
+            if len(args.captures) > 2:
+                raise RecoveryError("Выберите один или два снимка.")
+            comparison = compare_files(bundle, args.captures, args.mapping, project=args.project) if args.captures else None
+            result = fidelity(bundle.data, comparison)
+            if not args.private:
+                result = public_fidelity(result)
+            if args.out:
+                dest = local(args.out)
+                if any(dest.is_relative_to(local(root)) for root in (bundle.root, args.project) if root):
+                    raise RecoveryError("Сохраните отчёт отдельно от пакета и проекта.")
+                publish_text(dest, json.dumps(result, ensure_ascii=False, indent=2))
+                result = {"saved": True, "records": len(result["records"]), "quality": result["quality"]}
         elif args.command in {"operations", "recover-import", "import-diagnostic"}:
             from .owner import app_home
 

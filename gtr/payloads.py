@@ -85,7 +85,7 @@ def _candidate(item, representation):
     }
 
 
-def plan_media(assets, meta, ordinal, notes, *, documents_only=False):
+def plan_media(assets, meta, ordinal, notes, *, documents_only=False, missing_references=True):
     files, missing = [], []
     for asset in assets:
         if asset["status"] == "metadata":
@@ -117,7 +117,7 @@ def plan_media(assets, meta, ordinal, notes, *, documents_only=False):
     if structured:
         extra["exported_metadata"] = structured
         notes.append("structured_document")
-    if missing:
+    if missing and missing_references:
         extra["unavailable_attachments"] = missing
         notes.append("reference_document")
     stem = f"gtr-{ordinal:07d}"
@@ -205,9 +205,18 @@ def _attribute_shape(details):
                 and _integer(details.get("width"), 16384)
                 and _integer(details.get("height"), 16384)
                 and type(details.get("round")) is bool
+                and all(type(details[k]) is bool for k in ("nosound", "supports_streaming") if k in details)
+                and (
+                    "video_codec" not in details
+                    or isinstance(details["video_codec"], str) and re.fullmatch(r"[a-z0-9_]{1,32}", details["video_codec"])
+                )
             )
         case "audio":
-            return _integer(details.get("duration"), 7 * 86400) and type(details.get("voice")) is bool
+            return (
+                _integer(details.get("duration"), 7 * 86400) and type(details.get("voice")) is bool
+                and all(isinstance(details.get(key, ""), str) and len(details.get(key, "")) <= 128
+                        for key in ("title", "performer"))
+            )
         case "animation":
             return True
         case "sticker":

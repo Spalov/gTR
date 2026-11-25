@@ -185,6 +185,23 @@ class ImportWizard(QWidget):
         form.addRow("Первый номер записи", self.first)
         form.addRow("Последний номер записи", self.last)
         form.addRow(self.as_documents)
+        self.video = QComboBox()
+        self.video.setModel(self.window.import_video.model())
+        self.video.setCurrentIndex(self.window.import_video.currentIndex())
+        self.video.currentIndexChanged.connect(self.window.import_video.setCurrentIndex)
+        self.window.import_video.currentIndexChanged.connect(self.video.setCurrentIndex)
+        form.addRow("Видео", self.video)
+        self.kind = QComboBox()
+        self.kind.setModel(self.window.import_kind.model())
+        self.kind.setCurrentIndex(self.window.import_kind.currentIndex())
+        self.kind.currentIndexChanged.connect(self.window.import_kind.setCurrentIndex)
+        self.window.import_kind.currentIndexChanged.connect(self.kind.setCurrentIndex)
+        form.addRow("Тип исходной записи", self.kind)
+        self.notes = self.window.notes_checkbox()
+        self.notes.setChecked(self.window.import_notes.isChecked())
+        self.notes.toggled.connect(self.window.import_notes.setChecked)
+        self.window.import_notes.toggled.connect(self.notes.setChecked)
+        form.addRow(self.notes)
         area.addWidget(self.window_options)
         self.test_options = QWidget()
         test_form = QFormLayout(self.test_options)
@@ -206,6 +223,9 @@ class ImportWizard(QWidget):
             self.first.valueChanged,
             self.last.valueChanged,
             self.as_documents.toggled,
+            self.video.currentIndexChanged,
+            self.kind.currentIndexChanged,
+            self.notes.toggled,
             self.test_size.currentIndexChanged,
             self.test_type.currentIndexChanged,
         ):
@@ -379,6 +399,8 @@ class ImportWizard(QWidget):
         scenario, size = self.test_type.currentData(), self.test_size.currentData()
         content = "document" if mode == "text_media" and self.as_documents.isChecked() else mode
         associated = project if self.source == "project" and mode != "fixture" else None
+        video = self.window.video_options(self.video.currentData(), annotate=self.notes.isChecked())
+        kind = self.kind.currentData()
 
         def job(progress):
             if stored:
@@ -397,6 +419,8 @@ class ImportWizard(QWidget):
                     media_mode=content,
                     first_record=first,
                     last_record=last,
+                    record_kind=kind,
+                    **video,
                 )
             inventory = inspect_bundle(bundle, progress, hash_verified=True)
             evidence = check_local(bundle, associated, progress)

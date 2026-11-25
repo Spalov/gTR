@@ -10,13 +10,22 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep
 from urllib.error import URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
 from . import BETA_NUMBER
-from .files import BLOCK, local, name_key, new_directory, private_directory, safe_parts
+from .files import (
+    BLOCK,
+    local,
+    name_key,
+    new_directory,
+    private_directory,
+    publish_text,
+    safe_parts,
+)
 from .model import RecoveryError, quiet
 from .owner import app_home
 
@@ -25,6 +34,8 @@ ARCHIVE = re.compile(r"gTR-Beta-([1-9][0-9]{0,4})-Windows-x64\.zip")
 FOLDER = re.compile(r"gTR-Beta-([1-9][0-9]{0,4})")
 SHA256 = re.compile(r"[a-f0-9]{64}")
 RECEIPT = ".gtr-installed.json"
+FAILED_LAUNCH = ".gtr-launch-failed"
+BOOT_ENV = "GTR_UPDATE_BOOT_FILE"
 MAX_ARCHIVE = 512 * 1024**2
 MAX_EXTRACTED = 2 * 1024**3
 REQUIRED = ("gTR.cmd", "gtr/__init__.py", "runtime/pythonw.exe", "runtime/python314._pth")
@@ -214,6 +225,8 @@ def installed_update(current=BETA_NUMBER):
                 continue
             try:
                 folder = local(folder)
+                if (folder / FAILED_LAUNCH).exists():
+                    continue
                 with local(folder / RECEIPT).open("rb") as marker:
                     data = json.loads(marker.read(256))
                 if data["beta"] != int(match[1]) or not SHA256.fullmatch(data["sha256"]):
@@ -228,10 +241,42 @@ def installed_update(current=BETA_NUMBER):
     return latest
 
 
-def launch(folder, project=None):
+def launch(folder, project=None, *, timeout=30):
+    folder = local(Path(folder))
     runtime = local(folder / "runtime/pythonw.exe")
-    env = {k: v for k, v in os.environ.items() if k.upper() not in {"PYTHONPATH", "PYTHONHOME"}}
+    env = {k: v for k, v in os.environ.items() if k.upper() not in {"PYTHONPATH", "PYTHONHOME", BOOT_ENV}}
     command = [str(runtime), "-m", "gtr", "gui"]
     if project:
         command.extend(["--project", str(project)])
-    subprocess.Popen(command, cwd=folder, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        with TemporaryDirectory(dir=_versions(), prefix=".gtr-boot-") as temporary:
+            boot = Path(temporary)
+            private_directory(boot)
+            marker = boot / "ready"
+            env[BOOT_ENV] = str(marker)
+            process = subprocess.Popen(command, cwd=folder, env=env, creationflags=subprocess.CREATE_NO_WINDOW)
+            expires = monotonic() + timeout
+            while process.poll() is None and monotonic() < expires:
+                if marker.is_file() and marker.read_bytes() == b"ready":
+                    return
+                sleep(0.1)
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    publish_text(folder / FAILED_LAUNCH, "startup_failed\n", replace=True)
+    raise RecoveryError("Новая версия не запустилась. Можно продолжить работу в предыдущей версии.")
+
+
+def signal_ready():
+    value = os.environ.pop(BOOT_ENV, "")
+    if not value:
+        return
+    target = local(Path(value))
+    if target.name == "ready" and target.parent.name.startswith(".gtr-boot-") and target.parent.parent == _versions():
+        publish_text(target, "ready")

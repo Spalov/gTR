@@ -47,11 +47,17 @@ def date_diagnostics(db, progress=quiet):
         flags[mid].add(code)
     records = []
     for row in db.execute("""SELECT id,chat,source_id,source,date_raw,date_iso,meta FROM messages
-        WHERE lower(source) LIKE '%.html' ORDER BY chat,id"""):
+        ORDER BY chat,id"""):
         if len(records) % 250 == 0:
             progress("report", 0, 1)
         issues = flags[row["id"]]
-        evidence = json.loads(row["meta"]).get("date_evidence", {})
+        meta = json.loads(row["meta"])
+        evidence = meta.get("date_evidence", {})
+        comparison = meta.get("format_comparison", {})
+        alternate = {
+            key: comparison[key] for key in ("preferred", "date_conflict", "html_date", "html_parsed",
+                                             "json_date", "json_parsed") if key in comparison
+        }
         moment = datetime.fromisoformat(row["date_iso"]) if row["date_iso"] else None
         usable = bool(moment and not (issues & UNRELIABLE))
         status = "service_no_time" if "service_no_time" in issues else "parsed" if usable else "unresolved"
@@ -66,6 +72,8 @@ def date_diagnostics(db, progress=quiet):
                 "status": status,
                 "resolution": evidence.get("resolution", status),
                 "selected": evidence.get("selected"),
+                "precision": meta.get("historical_time", {}).get("precision", "unknown"),
+                **({"alternate_format": alternate} if alternate else {}),
                 "fields": evidence.get("fields", []),
                 "issues": [{"code": code, "reason": ISSUES[code]} for code in sorted(issues)],
             }
@@ -108,7 +116,13 @@ def project_report(project, progress=quiet):
     }
 
 
+EMPTY_TEXT = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
 def plan_summary(data):
+    records = data["records"]
+    statuses = Counter(r.get("video_recovery", {}).get("action") for r in records if r.get("video_recovery"))
+    media_bytes = sum(item["size"] for item in data["media"])
     return {
         "source_records": data.get("source_records", len(data["records"])),
         "selected": data.get("selected_records", len(data["records"])),
@@ -118,7 +132,20 @@ def plan_summary(data):
         "attachments": len(data["media"]),
         "omitted_assets": data.get("omitted_assets", 0),
         "media_mode": data.get("media_mode", "text_media"),
-        "media_bytes": sum(item["size"] for item in data["media"]),
+        "media_bytes": media_bytes,
+        "text_records": sum(bool(r.get("included")) and r.get("original_text_sha256", EMPTY_TEXT) != EMPTY_TEXT for r in records),
+        "forwards": sum(bool(r.get("structure", {}).get("forward")) for r in records),
+        "replies": sum(bool(r.get("reply_source_id")) for r in records),
+        "album_elements": sum(bool(r.get("structure", {}).get("album")) for r in records),
+        "albums": data.get("album_count"),
+        "missing_assets": sum(a["status"] in {"missing", "empty"} for r in records for a in r.get("original_media", [])),
+        "video_actions": dict(statuses),
+        "video_incompatible": sum(
+            r.get("video_recovery", {}).get("original", {}).get("status") not in {None, "compatible"}
+            for r in records
+        ),
+        "annotated_records": sum(bool(r.get("annotations")) for r in records),
+        "estimated_seconds_at_10_mbps": round(media_bytes * 8 / 10_000_000, 2),
         "timezone": data["timezone"],
         "date_policy": data.get("date_policy", "ordered"),
         "timeline": data.get("timeline", {}),
@@ -165,6 +192,10 @@ def _dates_html(dates):
             f"{item['field']} = {item['raw']} → {item['parsed'] or DATE_FIELD_STATES[item['status']]}"
             for item in record["fields"]
         )
+        if alternate := record.get("alternate_format"):
+            raw = alternate["html_date"] or "—"
+            moment = alternate["html_parsed"] or "—"
+            inputs = f"{inputs or record['raw']} · HTML {raw} → {moment}"
         notes = [labels.get(record["resolution"], labels[record["status"]])]
         notes.extend(item["reason"] for item in record["issues"] if item["reason"] != notes[0])
         rows.append(
@@ -179,8 +210,9 @@ def _dates_html(dates):
             )
         )
     counts = " · ".join(f"{labels[key]} {count}" for key, count in dates["counts"].items())
+    formats = " HTML" if all(row["file"].lower().endswith(".html") for row in dates["records"]) else ""
     return (
-        f"<h2>Диагностика дат HTML</h2><p>{escape(counts)}. Часовой пояс проекта {escape(dates['timezone'])}.</p>"
+        f"<h2>Диагностика дат{formats}</h2><p>{escape(counts)}. Часовой пояс проекта {escape(dates['timezone'])}.</p>"
         + _table(
             ("Диалог / ID", "Файл", "Выбрано", "Исходные поля", "Разобрано со смещением", "UTC", "Итог"), rows
         )
@@ -241,6 +273,43 @@ def project_html(report):
     )
 
 
+VIDEO_ACTIONS = {
+    "blocked": "Требуется решение", "keep": "Оригинал", "convert": "Совместимая копия",
+    "document": "Документ", "skip": "Пропуск",
+}
+VIDEO_RESULTS = {
+    "compatible": "Параметры подходят", "transcode_required": "Нужна совместимая копия",
+    "multiple_attachments": "Несколько вложений в одной записи", "no_video": "Нет видеопотока",
+    "missing_metadata": "Не определены длительность или размеры", "decode_failed": "Ошибка декодирования",
+    "probe_failed": "Не удалось прочитать потоки", "ffprobe_unavailable": "FFprobe не найден",
+    "unknown_container": "Контейнер не распознан", "corrupt_container": "Повреждённый контейнер",
+    "changed": "Файл изменился при анализе",
+}
+
+
+def _video_html(records):
+    rows = []
+    for record in records:
+        if not (video := record.get("video_recovery")):
+            continue
+        original = video.get("original", {})
+        output = video.get("output", {})
+        state = original.get("status")
+        dimensions = f"{original['width']} × {original['height']}" if original.get("width") else "—"
+        rows.append((
+            record["source_id"], original.get("container"), original.get("codec"),
+            ", ".join(original.get("audio") or ()), original.get("duration"), dimensions,
+            original.get("fps"), original.get("rotation"), original.get("streaming"),
+            VIDEO_RESULTS.get(state, state), VIDEO_ACTIONS[video["action"]], output.get("codec"),
+            video.get("original_sha256"), video.get("sha256"),
+        ))
+    return "<h2>Решения по видео</h2>" + _table(
+        ("ID", "Контейнер", "Видео", "Аудио", "Секунды", "Размер", "Кадры/с", "Поворот",
+         "Потоковое", "Проверка", "Решение", "Подготовленный кодек", "SHA-256 исходника", "SHA-256 копии"),
+        rows,
+    ) if rows else ""
+
+
 def package_html(data, *, planned=False):
     stats = plan_summary(data)
     dates = "Исходное время" if stats["date_policy"] == "historical" else "Альтернативные даты"
@@ -263,6 +332,16 @@ def package_html(data, *, planned=False):
                     ("Включённые сообщения", stats["included"]),
                     ("Пропущенные записи", stats["skipped"]),
                     ("Вложения", stats["attachments"]),
+                    ("Записи с текстом к отправке", stats["text_records"]),
+                    ("Пересланные записи", stats["forwards"]),
+                    ("Ответы", stats["replies"]),
+                    ("Альбомы", stats["albums"]),
+                    ("Элементы альбомов", stats["album_elements"]),
+                    ("Записей с историческими пометками", stats["annotated_records"]),
+                    ("Отсутствующие или пустые вложения", stats["missing_assets"]),
+                    ("Видео с неподтверждённой совместимостью", stats["video_incompatible"]),
+                    ("Совместимых копий", stats["video_actions"].get("convert", 0)),
+                    ("Оценка загрузки медиа при 10 Мбит/с, сек", stats["estimated_seconds_at_10_mbps"]),
                     ("Вложения, исключённые режимом пакета", stats["omitted_assets"]),
                     ("Байты вложений", stats["media_bytes"]),
                     ("Совпавшие временные метки", timeline.get("equal")),
@@ -304,6 +383,7 @@ def package_html(data, *, planned=False):
                     for item in data["media"]
                 ],
             ),
+            _video_html(data["records"]),
             "<h2>Ограничения и пропуски</h2>",
             _table(("Наблюдение", "Записи"), [(LOSS.get(k, k), v) for k, v in stats["losses"].items()]),
             "<h2>Записи с потерями</h2>",

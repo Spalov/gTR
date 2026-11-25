@@ -13,8 +13,8 @@ py -3.14 -m venv .venv
 .\.venv\Scripts\python.exe -m pytest --tb=short
 .\.venv\Scripts\python.exe packaging\build_release.py --archives-only
 .\.venv\Scripts\python.exe packaging\smoke_release.py --pytest
-Get-FileHash -Algorithm SHA256 release\gTR-Beta-4-Windows-x64.zip
-Get-FileHash -Algorithm SHA256 release\gTR-Beta-4-source.zip
+Get-FileHash -Algorithm SHA256 release\gTR-Beta-5-Windows-x64.zip
+Get-FileHash -Algorithm SHA256 release\gTR-Beta-5-source.zip
 ~~~
 
 The builder checks the official embedded runtime hash and the wheel versions. For an offline build, supply the cached official archive via `--python-embed PATH`. Use `--compiler PATH` to select the same Roslyn compiler explicitly. Both ZIPs and their checksums appear under `release`. Fixed ordering and normalized ZIP headers make builds repeatable from the same input bytes and toolchain. The native launcher is compiled in deterministic mode. A different compiler, dependency build, zlib version, source line encoding or signature can change the result.

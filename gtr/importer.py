@@ -85,6 +85,8 @@ def _media_attempt(index, total, item, record, facts=None):
         "ended_at": None,
         "error_code": None,
         "response_constructor": None,
+        "requested_kind": item["kind"] if item.get("attributes") or item["upload_as"] == "photo" else "document",
+        "received_kind": None,
         "local_issues": facts["issues"] if facts is not None else (),
     }
 
@@ -302,6 +304,7 @@ class ImportController:
             if self.journal and self.job:
                 self.journal.media_stage(self.job, index, name)
 
+        stage.response = lambda actual: attempt.update(received_kind=actual)
         report = getattr(self.progress, "upload_bytes", None)
         if report:
             stage.upload_bytes = lambda name, sent, size, speed: report(

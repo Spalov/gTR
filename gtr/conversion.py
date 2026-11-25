@@ -16,7 +16,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .archive import MAX_TOTAL_BYTES
 from .core import ISSUES, catalogue, encode, properties
 from .filenames import assign_names, safe_filename
-from .files import BLOCK, digest, local, new_directory, private_directory, read_json
+from .files import (
+    BLOCK,
+    digest,
+    local,
+    new_directory,
+    private_directory,
+    read_json,
+    safe_parts,
+)
 from .history import (
     DATE_POLICIES,
     HistoricalIdentity,
@@ -24,10 +32,13 @@ from .history import (
     first_reliable_time,
     ordered_rows,
 )
+from .media import KIND_NAMES
 from .model import RecoveryError, quiet
 from .payloads import STRUCTURED, plan_media, publish_media, validate_media_input
 from .profiles import MARKER, MEDIA_NAME, PROFILES, read_records, wire_line
 from .selection import decode_intervals, difference, included_intervals
+from .structure import annotated_text, historical_notes, local_structure
+from .video import VIDEO_KINDS, VIDEO_POLICIES, MediaTools, prepare_video
 
 PROFILE = PROFILES["ios"]
 MEDIA_MODES = {
@@ -63,6 +74,14 @@ LOSS = {
     "structured_document": "Исходные структурированные данные вложены в виде документа",
     "reference_document": "Документ описывает недоступный оригинал",
     "media_attributes": "Пакет содержит применимые атрибуты медиа",
+    "video_decision": "Для видео требуется выбрать совместимую копию, документ или пропуск",
+    "audio_unconfirmed": "Не удалось подтвердить нативный тип или длительность аудио",
+    "audio_unreadable": "Локальная проверка аудио не пройдена",
+    "group_video_document": "Многовложенная запись с видео подготовлена в виде одного архива",
+    "video_document": "Пользователь выбрал передачу видео документом",
+    "video_skipped": "Несовместимое видео пропущено по выбору пользователя",
+    "video_transcode": "Для видео выбрана совместимая копия H.264/AAC",
+    "type_selection": "Тип записи вне выборки",
     "sample_limit": "Запись за пределами экспериментальной выборки",
     "outside_selection": "Запись за пределами выбранного диапазона",
     "text_only_media": "Вложения и структурированные данные остаются в проекте",
@@ -153,6 +172,12 @@ def _text_losses(row, flags, meta):
     return [code for code, present in observations.items() if present]
 
 
+RECORD_KINDS = {
+    "all": "Все записи", "text": "Текст без вложений", "forward": "Пересланные сообщения",
+    **{key: name for key, name in KIND_NAMES.items() if key != "text"},
+}
+
+
 def plan_import(
     project,
     chat_id,
@@ -167,6 +192,11 @@ def plan_import(
     last_record=None,
     record_ranges=None,
     write_line=None,
+    video_policy=None,
+    media_tools=None,
+    video_work=None,
+    annotate=False,
+    record_kind="all",
 ):
     """Build the same ledger for a read-only preview and for a published package."""
     try:
@@ -177,6 +207,8 @@ def plan_import(
         profile not in PROFILES
         or date_policy not in DATE_POLICIES
         or media_mode not in MEDIA_MODES
+        or video_policy not in (None, *VIDEO_POLICIES)
+        or record_kind not in RECORD_KINDS
         or (sample is not None and sample < 1)
         or type(first_record) is not int
         or not 1 <= first_record <= 2**31 - 1
@@ -189,7 +221,10 @@ def plan_import(
     if record_ranges is not None:
         record_ranges = decode_intervals(record_ranges)
     starts = tuple(first for first, _ in record_ranges or ())
+    date_policy = "historical"
     profile = PROFILES[profile]
+    if video_policy and media_mode == "text_media" and media_tools is None:
+        media_tools = MediaTools()
     with catalogue(project) as db:
         chat = db.execute("SELECT title FROM chats WHERE id=?", (chat_id,)).fetchone()
         if not chat:
@@ -212,6 +247,7 @@ def plan_import(
         issues = dict(db.execute("SELECT code,count(*) FROM issues WHERE chat=? GROUP BY code", (chat_id,)))
         media, records, losses = [], [], Counter()
         used_names = {}
+        album_ids = set()
         text_hash, included, omitted_assets, selected = hashlib.sha256(), 0, 0, 0
         for i, row in enumerate(rows, 1):
             if i % 100 == 1:
@@ -226,17 +262,28 @@ def plan_import(
                 position = bisect_right(starts, source_ordinal) - 1
                 in_window = position >= 0 and source_ordinal <= record_ranges[position][1]
             in_sample = sample is None or included < sample
-            selected += int(in_window and in_sample and not row["service"])
             reason = skip_reason(row, ambiguous)
-            if not reason:
-                reason = "outside_selection" if not in_window else "sample_limit" if not in_sample else ""
             notes, body, item = [], row["text"], None
+            video = audio = None
             identity = HistoricalIdentity.read(row, flags)
             assets = db.execute(
                 """SELECT a.*,f.size,f.sha256,f.mime FROM assets a
                     LEFT JOIN files f ON f.path=a.path WHERE msg=? ORDER BY a.id""",
                 (row["id"],),
             ).fetchall()
+            structure = local_structure(meta, row["rich"])
+            type_match = (
+                record_kind == "all"
+                or record_kind == "text" and bool(body) and not assets
+                or record_kind == "forward" and structure["forward"]
+                or any(asset["kind"] == record_kind for asset in assets)
+            )
+            selected += int(in_window and in_sample and type_match and not row["service"])
+            if not reason:
+                reason = (
+                    "outside_selection" if not in_window else "type_selection" if not type_match
+                    else "sample_limit" if not in_sample else ""
+                )
             if media_mode == "text_only":
                 omitted_assets += len(assets)
                 has_media = bool(assets) or any(meta.get(key) is not None for key in STRUCTURED)
@@ -246,9 +293,53 @@ def plan_import(
                     reason = "text_only_empty" if has_media else "empty"
             elif not reason:
                 item = plan_media(
-                    assets, meta, len(media) + 1, notes, documents_only=media_mode == "document"
+                    assets, meta, len(media) + 1, notes, documents_only=media_mode == "document",
+                    missing_references=video_policy is None,
                 )
-                if not body and not item:
+                grouped_video = bool(item and any(member["kind"] in VIDEO_KINDS for member in item.get("members", [])))
+                if video_policy and media_mode == "text_media" and grouped_video:
+                    if video_policy == "document":
+                        notes.append("group_video_document")
+                    elif video_policy == "skip":
+                        notes = [key for key in notes if key != "grouped_media"]
+                        item = plan_media(
+                            [a for a in assets if a["kind"] not in VIDEO_KINDS], meta,
+                            len(media) + 1, notes, missing_references=False,
+                        )
+                        notes.append("video_skipped")
+                        video = {"action": "skip", "scope": "group"}
+                    else:
+                        video = {"action": "blocked", "scope": "group", "original": {"status": "multiple_attachments"}}
+                        reason = "video_decision"
+                        item = None
+                if (
+                    media_tools and video_policy and media_mode == "text_media"
+                    and item and item["source"] and item["kind"] in VIDEO_KINDS
+                ):
+                    source = Path(project).joinpath("source", *safe_parts(item["source"]))
+                    notes = [note for note in notes if note not in {"document_fallback", "media_attributes"}]
+                    item, video = prepare_video(item, source, video_policy, media_tools, progress, video_work)
+                    if video["action"] == "blocked":
+                        reason = "video_decision"
+                    elif key := {"document": "video_document", "skip": "video_skipped",
+                                  "convert": "video_transcode"}.get(video["action"]):
+                        notes.append(key)
+                if (
+                    media_tools and video_policy and media_mode == "text_media"
+                    and item and item["source"] and item["kind"] in {"audio", "voice"}
+                ):
+                    source = Path(project).joinpath("source", *safe_parts(item["source"]))
+                    audio = media_tools.audio(source, item, progress)
+                    attributes = audio["attributes"]
+                    if attributes:
+                        notes = [key for key in notes if key not in {"document_fallback", "media_attributes"}]
+                        item.update(attributes=attributes, representation="specialized_document")
+                    elif audio["status"] == "audio_unreadable":
+                        item = None
+                        notes.append("audio_unreadable")
+                    else:
+                        notes.append("audio_unconfirmed")
+                if not reason and not body and not item:
                     reason = "empty"
             date, change = (
                 clock.next(row["date_iso"], not identity.date_reliable) if not reason else (None, "")
@@ -279,9 +370,23 @@ def plan_import(
                 "included": not reason,
                 "losses": notes,
             }
+            structure.update({
+                "line_breaks": "\n" in body, "unicode": not body.isascii(),
+                "emoji": any(0x1F000 <= ord(letter) <= 0x1FAFF for letter in body),
+            })
+            if present := {key: True for key, value in structure.items() if value}:
+                record["structure"] = present
+            if (album_id := meta.get("album_id")) and in_window:
+                album_ids.add(str(album_id))
+            if video:
+                record["video_recovery"] = video
+            if audio:
+                record["audio_recovery"] = audio
             if media_mode == "text_only":
                 record["omitted_media_count"] = len(assets)
             if reason:
+                if item and item.get("transform") and video_work is not None:
+                    (video_work / item["name"]).unlink()
                 notes.append(reason)
             else:
                 if item:
@@ -290,7 +395,11 @@ def plan_import(
                     notes.append("missing_source_id")
                 if change:
                     notes.append(change)
-                line = wire_line(profile, date, row["sender"], body, item["name"] if item else None).encode(
+                annotations = historical_notes(meta) if annotate else {}
+                if annotations:
+                    record["annotations"] = annotations
+                wire_body = annotated_text(body, annotations)
+                line = wire_line(profile, date, row["sender"], wire_body, item["name"] if item else None).encode(
                     "utf-8"
                 )
                 text_hash.update(line)
@@ -300,7 +409,7 @@ def plan_import(
                 record["ordinal"] = included
                 record["import_date"] = date.isoformat(timespec="seconds")
                 record["import_utc"] = clock.utc(date, row["date_iso"])
-                record["text_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+                record["text_sha256"] = hashlib.sha256(wire_body.encode("utf-8")).hexdigest()
                 if item:
                     record["media"] = item["name"]
                     media.append(item)
@@ -318,6 +427,9 @@ def plan_import(
         "source_kind": source_props["source_type"],
         "date_policy": date_policy,
         "media_mode": media_mode,
+        **({"video_policy": video_policy} if video_policy else {}),
+        **({"annotate": True} if annotate else {}),
+        "album_count": len(album_ids),
         "media_count": len(media),
         "source_records": total,
         "selected_records": selected,
@@ -325,6 +437,7 @@ def plan_import(
             "first_record": first_record,
             "last_record": last_record,
             "sample": sample,
+            **({"record_kind": record_kind} if record_kind != "all" else {}),
             **({"ranges": record_ranges} if record_ranges is not None else {}),
         },
         "omitted_assets": omitted_assets,
@@ -368,6 +481,10 @@ def prepare(
     last_record=None,
     record_ranges=None,
     test_reset_id=None,
+    video_policy=None,
+    media_tools=None,
+    annotate=False,
+    record_kind="all",
 ):
     from .reports import package_html
 
@@ -393,11 +510,29 @@ def prepare(
                 last_record=last_record,
                 record_ranges=record_ranges,
                 write_line=transcript.write,
+                video_policy=video_policy,
+                media_tools=media_tools,
+                video_work=work / ".video",
+                annotate=annotate,
+                record_kind=record_kind,
             )
-        if record_ranges is not None and included_intervals(data["records"]) != decode_intervals(
-            record_ranges
-        ):
-            raise RecoveryError("Состав доступных записей изменился. Повторите сверку исходного проекта.")
+        if data["losses"].get("video_decision"):
+            raise RecoveryError(
+                f"Для {data['losses']['video_decision']} видео выберите совместимую копию, документ или пропуск. "
+                "Сначала откройте локальный план для просмотра причин."
+            )
+        if record_ranges is not None:
+            actual = included_intervals(data["records"])
+            reviewed = decode_intervals(record_ranges)
+            if actual != reviewed:
+                skipped = included_intervals([
+                    {**r, "included": True} for r in data["records"]
+                    if not r["included"] and "empty" in r["losses"]
+                    and r.get("video_recovery", {}).get("action") == "skip"
+                ])
+                if not actual or difference(actual, reviewed) or difference(difference(reviewed, actual), skipped):
+                    raise RecoveryError("Состав доступных записей изменился. Повторите сверку исходного проекта.")
+                data["selection"]["ranges"] = actual
         if fixture is not None:
             data["fixture"] = fixture
         if test_reset_id is not None:
@@ -409,20 +544,26 @@ def prepare(
         _require_space(work, estimated)
         for i, item in enumerate(data["media"], 1):
             path = work / "media" / item["storage_name"]
-            publish_media(
-                project,
-                item,
-                path,
-                lambda i=i: progress("media", i - 1, len(data["media"])),
-            )
+            if item.get("transform"):
+                (work / ".video" / item["storage_name"]).replace(path)
+            else:
+                publish_media(
+                    project,
+                    item,
+                    path,
+                    lambda i=i: progress("media", i - 1, len(data["media"])),
+                )
             try:
                 validate_media_input(item, path, strict=True)
             except ValueError:
                 raise RecoveryError(f"Локальная проверка вложения {item['name']} не пройдена.") from None
             progress("media", i, len(data["media"]))
+        if (work / ".video").is_dir():
+            (work / ".video").rmdir()
         if sum(item["size"] for item in data["media"]) > MAX_TOTAL_BYTES:
             raise RecoveryError("Объём вложений превышает локальный предел пакета.")
-        (work / "manifest.json").write_text(encode(data) + "\n", encoding="utf-8")
+        with (work / "manifest.json").open("w", encoding="utf-8", newline="\n") as output:
+            encode_manifest(data, output, progress)
         (work / "report.html").write_text(package_html(data), encoding="utf-8")
         progress("finish", 1, 1)
     return Bundle(dest, data)
@@ -451,7 +592,32 @@ def prepare_eligible(project, bundle, dest, eligible, progress=quiet):
         fixture=bundle.data.get("fixture"),
         record_ranges=eligible,
         test_reset_id=bundle.data.get("test_reset_id"),
+        video_policy=bundle.data.get("video_policy"),
+        annotate=bundle.data.get("annotate", False),
+        record_kind=bundle.data.get("selection", {}).get("record_kind", "all"),
     )
+
+
+def encode_manifest(data, output, progress):
+    """Write large manifests by record, producing the same canonical key order."""
+    output.write("{")
+    for index, key in enumerate(sorted(data)):
+        if index:
+            output.write(",")
+        output.write(encode(key) + ":")
+        if key not in {"records", "media"}:
+            output.write(encode(data[key]))
+            continue
+        output.write("[")
+        total = len(data[key])
+        for position, row in enumerate(data[key]):
+            if position % 100 == 0:
+                progress("write_manifest", position, total)
+            if position:
+                output.write(",")
+            output.write(encode(row))
+        output.write("]")
+    output.write("}\n")
 
 
 def load_bundle(root, progress=quiet):
@@ -494,6 +660,8 @@ def load_bundle(root, progress=quiet):
                     raise ValueError
                 previous=pos
         mode = data.get("media_mode", "text_media")
+        if data.get("video_policy") not in (None, *VIDEO_POLICIES):
+            raise ValueError
         if (
             type(data["chat_id"]) is not int
             or not re.fullmatch(r"[a-f0-9]{64}", data["source_sha256"])
@@ -530,7 +698,8 @@ def load_bundle(root, progress=quiet):
             first, last, sample = (selection[k] for k in ("first_record", "last_record", "sample"))
             selected = data["selected_records"]
             if (
-                type(first) is not int
+                selection.get("record_kind", "all") not in RECORD_KINDS
+                or type(first) is not int
                 or not 1 <= first <= 2**31 - 1
                 or (last is not None and (type(last) is not int or not first <= last <= 2**31 - 1))
                 or (sample is not None and (type(sample) is not int or sample < max(1, data["included"])))
@@ -587,6 +756,14 @@ def load_bundle(root, progress=quiet):
             path = bundle.media_path(item)
             total_bytes += item["size"]
             if total_bytes > MAX_TOTAL_BYTES:
+                raise ValueError
+            transform = item.get("transform")
+            if transform and (
+                not isinstance(transform, dict) or data.get("video_policy") != "compatible"
+                or transform.get("type") != "mp4_h264_aac" or item["mime"] != "video/mp4"
+                or not re.fullmatch(r"[a-f0-9]{64}", transform.get("original_sha256", ""))
+                or item.get("attributes", {}).get("video_codec") != "h264"
+            ):
                 raise ValueError
             validate_media_input(item, path, strict=modern)
             if (

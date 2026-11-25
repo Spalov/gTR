@@ -3,6 +3,7 @@ import json
 import sys
 from datetime import UTC, date, datetime
 from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 from zipfile import ZipFile
 
@@ -219,3 +220,30 @@ def test_update_rejects_duplicate_windows_paths(tmp_path, monkeypatch):
     with pytest.raises(RecoveryError, match="недопустимый путь"):
         updates.install(found)
     assert updates.installed_update() is None
+
+
+@pytest.mark.parametrize("works", [True, False])
+def test_portable_launch_rolls_back_when_new_window_does_not_open(tmp_path, monkeypatch, works):
+    found = updates.candidate(update_file(tmp_path, NEXT))
+    mock_release(monkeypatch, asset_data(found))
+    installed = updates.install(found)
+    previous = app_home() / "projects" / "synthetic.txt"
+    previous.parent.mkdir()
+    previous.write_bytes(b"synthetic data")
+
+    def launch(command, cwd, env, creationflags):
+        assert cwd == installed and Path(command[0]).name == "pythonw.exe"
+        assert "PYTHONPATH" not in env
+        if works:
+            Path(env[updates.BOOT_ENV]).write_bytes(b"ready")
+        return SimpleNamespace(poll=lambda: None if works else 1)
+
+    monkeypatch.setattr(updates.subprocess, "Popen", launch)
+    if works:
+        updates.launch(installed)
+        assert updates.installed_update() == installed
+    else:
+        with pytest.raises(RecoveryError, match="Новая версия не запустилась"):
+            updates.launch(installed)
+        assert updates.installed_update() is None
+    assert previous.read_bytes() == b"synthetic data"

@@ -58,6 +58,8 @@ def assign_names(item, meta, used):
         labels = {}
     original = safe_filename(labels.get(item["source"]) or meta.get("file_name")) if item["source"] else ""
     display = original or display_name(item)
+    if item.get("transform"):
+        display = safe_filename(PurePosixPath(display).stem + ".mp4")
     provenance = "export_metadata" if original else "export_basename" if item["source"] else "generated"
     item.update(
         storage_name=item["name"],

@@ -55,6 +55,7 @@ class Chat:
     messages: list[Message] = field(default_factory=list)
     pages: int = 1
     peer_key: str = ""
+    source: str = ""
 
 
 @dataclass(frozen=True)

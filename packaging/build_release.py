@@ -78,6 +78,8 @@ def app_files():
                 "LIMITATIONS.md",
                 "UPGRADE.md",
                 "KNOWN_LIMITATIONS.md",
+                "PRIVACY.md",
+                "SECURITY.md",
             )
         ),
         *sorted(ROOT.glob("gtr/*.py")),
@@ -97,6 +99,14 @@ def app_files():
                 "BETA_ENGINEERING.md",
                 "INCREMENTAL_IMPORT.md",
                 "MEDIA_FILENAME_HANDLING.md",
+                "RECOVERY_ENGINE.md",
+                "MEDIA_RECOVERY.md",
+                "FORWARDED_MESSAGES.md",
+                "VERIFICATION.md",
+                "API_LIMITATIONS.md",
+                "DATABASE_MIGRATION.md",
+                "SECURITY_AUDIT.md",
+                "BETA_5_TEST_PLAN.md",
             )
         ),
     ]
@@ -111,6 +121,7 @@ def source_archive(path):
         *ROOT.glob("tests/*.py"),
         ROOT / "tests/fixtures/synthetic.rar",
         ROOT / "packaging/build_release.py",
+        ROOT / "packaging/benchmark_recovery.py",
         ROOT / "packaging/make_icon.py",
         ROOT / "packaging/smoke_release.py",
         ROOT / "packaging" / "Launcher.cs",

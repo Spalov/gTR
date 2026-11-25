@@ -74,6 +74,8 @@ class WireClock:
         return (date.astimezone(self.zone) if self.zone else date).replace(tzinfo=None, microsecond=0)
 
     def utc(self, date: datetime, original: str) -> str:
+        if self.policy == "historical" and original:
+            return datetime.fromisoformat(original).astimezone(UTC).isoformat(timespec="seconds")
         zone = self.zone or (datetime.fromisoformat(original).tzinfo if original else UTC)
         return date.replace(tzinfo=zone).astimezone(UTC).isoformat(timespec="seconds")
 

@@ -65,7 +65,7 @@ def timestamp(raw, epoch, zone, flags):
             flags.append("invalid_epoch")
     if raw:
         try:
-            wall = wall_time(raw)
+            wall = wall_time(raw, require_clock=True)
         except (*PARSE_ERRORS, AttributeError):
             flags.append("invalid_wall_date")
     try:

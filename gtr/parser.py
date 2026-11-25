@@ -10,8 +10,20 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from .dates import html_timestamp, timestamp
+from .export_json import MultipleChats
+from .export_json import fields as json_fields
 from .identity import html_author, json_author
-from .model import Asset, Chat, Message, Progress, RecoveryError, Snapshot, quiet
+from .model import (
+    Asset,
+    Cancelled,
+    Chat,
+    Message,
+    Progress,
+    RecoveryError,
+    Snapshot,
+    quiet,
+)
+from .structure import enrich, match_secondary_evidence, unicode_text
 
 PAGE = re.compile(r"messages(\d*)\.html$", re.IGNORECASE)
 MESSAGE_ID = re.compile(r"message(-?\d+)$")
@@ -190,6 +202,7 @@ def html_assets(body, base, meta):
 
 def parse_html(snap, folder, pages, zone, progress):
     chat = Chat("html:" + (folder or "."), folder or "Диалог", pages=len(pages))
+    chat.source = min(pages)[1] if pages else ""
     previous, last_page, day = "", 0, ""
     for page_number, name in sorted(pages):
         progress("parse", last_page, len(pages))
@@ -234,7 +247,7 @@ def parse_html(snap, folder, pages, zone, progress):
             else:
                 raw, iso, meta["date_evidence"] = html_timestamp(fields, zone, flags)
             payload = body
-            forward_body = body.find("div", class_="forwarded body", recursive=False)
+            forward_body = body.select_one(":scope > .forwarded.body")
             if forward_body:
                 payload = forward_body
                 source = direct(payload, "from_name")
@@ -243,6 +256,10 @@ def parse_html(snap, folder, pages, zone, progress):
                     if source
                     else ""
                 )
+                if source:
+                    for key in ("forwarded-from-id", "forward-privacy", "forwarded-date"):
+                        if value := source.get("data-" + key):
+                            meta[key.replace("-", "_")] = value
             content = direct(payload, "text")
             plain, rich = html_content(body if service else content)
             reply_tag = direct(body, "reply_to") or direct(payload, "reply_to")
@@ -258,7 +275,14 @@ def parse_html(snap, folder, pages, zone, progress):
                 meta["unresolved_reply"] = True
             if direct(body, "reactions"):
                 meta["reactions"] = direct(body, "reactions").get_text(" ", strip=True)
+            if quote := direct(body, "reply_quote"):
+                meta["reply_to_quote"] = quote.get_text(" ", strip=True)
+            if node.get("data-grouped-id"):
+                meta["grouped_id"] = node["data-grouped-id"]
+            if edited := direct(body, "edited"):
+                meta["edited"] = edited.get("title") or edited.get_text(strip=True)
             assets = html_assets(payload, folder, meta)
+            enrich(meta, raw, iso, "html", zone)
             chat.messages.append(
                 Message(
                     sid,
@@ -281,10 +305,11 @@ def parse_html(snap, folder, pages, zone, progress):
 
 def json_text(value):
     if isinstance(value, str):
+        value = unicode_text(value)
         return value, html.escape(value).replace("\n", "<br>")
     plain, rich = [], []
     for entity in value or []:
-        text = entity if isinstance(entity, str) else entity.get("text", "")
+        text = unicode_text(entity if isinstance(entity, str) else entity.get("text", ""))
         formatted = html.escape(text).replace("\n", "<br>")
         tag = ENTITY.get(entity.get("type")) if isinstance(entity, dict) else None
         plain.append(text)
@@ -306,7 +331,130 @@ PEER_PREFIX = {
 }
 
 
-def parse_json(snap, name, zone, progress):
+def json_chat(item, name, index):
+    chat = Chat(
+        f"json:{name}:{item.get('type', '')}:{item.get('id', index)}:{index}",
+        item.get("name") or "Диалог",
+    )
+    prefix = PEER_PREFIX.get(item.get("type"))
+    if prefix and re.fullmatch(r"-?[1-9]\d{0,18}", str(item.get("id", ""))):
+        chat.peer_key = prefix + str(item["id"])
+    return chat
+
+
+def author_label(labels, message):
+    source_id = message.get("from_id") or message.get("actor_id")
+    label = message.get("from") or message.get("actor")
+    if source_id and label:
+        labels[str(source_id)].add(label)
+
+
+def json_messages(rows, name, zone, chat, labels, total, progress):
+    for offset, msg in enumerate(rows):
+        if offset % 250 == 0:
+            progress("parse", offset, total)
+        flags = []
+        raw = msg.get("date", "")
+        iso = timestamp(raw, msg.get("date_unixtime"), zone, flags)
+        plain, rich = json_text(msg.get("text", ""))
+        if msg.get("text_entities"):
+            entity_text, entity_rich = json_text(msg["text_entities"])
+            if entity_text == plain:
+                rich = entity_rich
+            else:
+                flags.append("entity_mismatch")
+        sender, sender_key, identity = json_author(msg, labels)
+        raw_id = str(msg["id"]) if msg.get("id") is not None else ""
+        sid = raw_id if re.fullmatch(r"-?\d+", raw_id) else ""
+        assets = []
+        base = str(PurePosixPath(name).parent)
+        for key in ("photo", "file", "contact_vcard"):
+            if key in msg:
+                kind = {"photo": "photo", "contact_vcard": "contact"}.get(key) or MEDIA_TYPES.get(
+                    msg.get("media_type"), "document"
+                )
+                size = msg.get(key + "_file_size" if key != "file" else "file_size")
+                assets.append(Asset(kind, msg[key] or "", base, size, msg.get("mime_type", "")))
+        if msg.get("contact_information") is not None and "contact_vcard" not in msg:
+            assets.append(Asset("contact", "", base, metadata=True))
+        if msg.get("location_information") is not None:
+            assets.append(Asset("location", "", base, metadata=True))
+        meta = {k: v for k, v in msg.items() if k not in {"text", "photo", "file", "from", "date", "id"}}
+        meta.update(identity)
+        if not meta.get("text_entities") and isinstance(msg.get("text"), list):
+            meta["text_entities"] = msg["text"]
+        enrich(meta, raw, iso, "json", zone)
+        if raw_id and not sid:
+            meta["source_id_raw"] = raw_id
+        reply_peer = str(msg.get("reply_to_peer_id") or "")
+        if reply_peer == chat.peer_key:
+            reply_peer = ""
+        yield Message(
+            sid,
+            sender,
+            sender_key,
+            raw,
+            iso,
+            plain,
+            rich,
+            name,
+            str(msg.get("reply_to_message_id") or ""),
+            reply_peer,
+            msg.get("type", "message") != "message",
+            assets,
+            meta,
+            flags,
+        )
+
+
+class MessageRows:
+    """Repeatable streaming rows for catalogue creation and attachment discovery."""
+
+    def __init__(self, reader, count):
+        self.reader = reader
+        self.count = count
+
+    def __iter__(self):
+        return iter(self.reader())
+
+    def __len__(self):
+        return self.count
+
+
+def stream_json(snap, name, zone, progress):
+    path = snap.root / name
+    header, count, found = {}, 0, False
+    labels = defaultdict(set)
+    for key, value in json_fields(path):
+        if key == "messages":
+            if found:
+                raise ValueError("More than one message array")
+            found = True
+        elif key is None:
+            if count % 250 == 0:
+                progress("parse", count, 0)
+            author_label(labels, value)
+            count += 1
+        else:
+            header[key] = value
+    if not found:
+        raise RecoveryError("В JSON отсутствует список сообщений.")
+
+    def read_rows():
+        return (value for key, value in json_fields(path) if key is None)
+
+    chat = json_chat(header, name, 0)
+    chat.messages = MessageRows(lambda: json_messages(read_rows(), name, zone, chat, labels, count, progress), count)
+    chat.source = name
+    return [chat]
+
+
+def parse_json(snap, name, zone, progress, *, stream=False):
+    if stream and 1024**2 <= snap.files[name].size <= MAX_PAGE:
+        try:
+            return stream_json(snap, name, zone, progress)
+        except MultipleChats:
+            pass
     data = json.loads(read_text(snap, name))
     if not isinstance(data, dict):
         raise RecoveryError("Неизвестная структура JSON-экспорта.")
@@ -316,73 +464,13 @@ def parse_json(snap, name, zone, progress):
         items = [c for group in ("chats", "left_chats") for c in data.get(group, {}).get("list", [])]
     chats = []
     for index, item in enumerate(items):
-        chat = Chat(
-            f"json:{name}:{item.get('type', '')}:{item.get('id', index)}:{index}",
-            item.get("name") or "Диалог",
-        )
-        prefix = PEER_PREFIX.get(item.get("type"))
-        if prefix and re.fullmatch(r"-?[1-9]\d{0,18}", str(item.get("id", ""))):
-            chat.peer_key = prefix + str(item["id"])
+        chat = json_chat(item, name, index)
+        chat.source = name
         rows = item["messages"]
         labels = defaultdict(set)
         for msg in rows:
-            source_id, label = msg.get("from_id") or msg.get("actor_id"), msg.get("from") or msg.get("actor")
-            if source_id and label:
-                labels[str(source_id)].add(label)
-        for offset, msg in enumerate(rows):
-            if offset % 250 == 0:
-                progress("parse", offset, len(rows))
-            flags = []
-            raw = msg.get("date", "")
-            iso = timestamp(raw, msg.get("date_unixtime"), zone, flags)
-            plain, rich = json_text(msg.get("text", ""))
-            if msg.get("text_entities"):
-                entity_text, entity_rich = json_text(msg["text_entities"])
-                if entity_text == plain:
-                    rich = entity_rich
-                else:
-                    flags.append("entity_mismatch")
-            sender, sender_key, identity = json_author(msg, labels)
-            raw_id = str(msg["id"]) if msg.get("id") is not None else ""
-            sid = raw_id if re.fullmatch(r"-?\d+", raw_id) else ""
-            assets = []
-            base = str(PurePosixPath(name).parent)
-            for key in ("photo", "file", "contact_vcard"):
-                if key in msg:
-                    kind = {"photo": "photo", "contact_vcard": "contact"}.get(key) or MEDIA_TYPES.get(
-                        msg.get("media_type"), "document"
-                    )
-                    size = msg.get(key + "_file_size" if key != "file" else "file_size")
-                    assets.append(Asset(kind, msg[key] or "", base, size, msg.get("mime_type", "")))
-            if msg.get("contact_information") is not None and "contact_vcard" not in msg:
-                assets.append(Asset("contact", "", base, metadata=True))
-            if msg.get("location_information") is not None:
-                assets.append(Asset("location", "", base, metadata=True))
-            meta = {k: v for k, v in msg.items() if k not in {"text", "photo", "file", "from", "date", "id"}}
-            meta.update(identity)
-            if raw_id and not sid:
-                meta["source_id_raw"] = raw_id
-            reply_peer = str(msg.get("reply_to_peer_id") or "")
-            if reply_peer == chat.peer_key:
-                reply_peer = ""
-            chat.messages.append(
-                Message(
-                    sid,
-                    sender,
-                    sender_key,
-                    raw,
-                    iso,
-                    plain,
-                    rich,
-                    name,
-                    str(msg.get("reply_to_message_id") or ""),
-                    reply_peer,
-                    msg.get("type", "message") != "message",
-                    assets,
-                    meta,
-                    flags,
-                )
-            )
+            author_label(labels, msg)
+        chat.messages.extend(json_messages(rows, name, zone, chat, labels, len(rows), progress))
         chats.append(chat)
     return chats
 
@@ -444,7 +532,7 @@ def discover(snap: Snapshot):
 
 
 def parse(
-    snap: Snapshot, timezone_name: str, progress: Progress = quiet, *, export_format="auto", sources=None
+    snap: Snapshot, timezone_name: str, progress: Progress = quiet, *, export_format="auto", sources=None, stream=False
 ) -> list[Chat]:
     try:
         zone = ZoneInfo(timezone_name)
@@ -461,7 +549,7 @@ def parse(
         if chosen == "json":
             for name in json_files:
                 progress("parse", 0, 0)
-                chats.extend(parse_json(snap, name, zone, progress))
+                chats.extend(parse_json(snap, name, zone, progress, stream=stream and (not groups or export_format == "json")))
         else:
             for folder, pages in groups.items():
                 chats.append(parse_html(snap, folder, pages, zone, progress))
@@ -469,4 +557,14 @@ def parse(
         raise RecoveryError("Не удалось разобрать структуру экспорта Telegram Desktop.") from None
     if not chats:
         raise RecoveryError("В источнике не найден диалог Telegram Desktop.")
+    if export_format == "auto" and chosen == "json" and groups:
+        secondary = []
+        for folder, pages in groups.items():
+            try:
+                secondary.append(parse_html(snap, folder, pages, zone, progress))
+            except Cancelled:
+                raise
+            except (RecoveryError, ValueError, TypeError, AttributeError, KeyError, RecursionError):
+                continue
+        match_secondary_evidence(chats, secondary)
     return chats
