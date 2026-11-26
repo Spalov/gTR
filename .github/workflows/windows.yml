@@ -10,12 +10,35 @@ jobs:
           python-version: '3.14.10'
           architecture: x64
       - run: python -m pip install -r requirements-win64.txt
-      - name: Set up Qt MSVC x64
+      - name: Set up Qt 6.12.0 MSVC x64
         shell: pwsh
         run: |
-          python -m pip install aqtinstall
-          python -m aqt install-qt windows desktop 6.12.0 win64_msvc2022_64 -m qtmultimedia -O build\qt
-          "GTR_QT_SDK=$PWD\build\qt\6.12.0\msvc2022_64" >> $env:GITHUB_ENV
+          # Qt 6.12 publishes Windows metadata in architecture-specific repositories.
+          $repo = 'https://master.qt.io/online/qtsdkrepository/windows_x86/desktop/qt6_6120/qt6_6120_msvc2022_64'
+          $build = '6.12.0-0-202609280346'
+          $sdk = Join-Path $env:RUNNER_TEMP 'gtr-qt-6.12.0-msvc2022-x64'
+          $modules = @(
+            @{ Name = 'qtbase'; Package = 'qt.qt6.6120.win64_msvc2022_64'; SHA256 = '219D1B86DEF3BE418E31D704572BC4ACC91B2EC373C65595C9FB12B42BF098DC' }
+            @{ Name = 'qtmultimedia'; Package = 'qt.qt6.6120.addons.qtmultimedia.win64_msvc2022_64'; SHA256 = '2592ACD8FC6C86F91106EF4E7262AD3C0954248BE4FD4B74BBD1C2B1A1BA70B9' }
+          )
+          New-Item -ItemType Directory -Path $sdk -Force | Out-Null
+          Push-Location -LiteralPath $sdk
+          try {
+            foreach ($module in $modules) {
+              $archive = "$($module.Name)-Windows-Windows_11_24H2-MSVC2022-Windows-Windows_11_24H2-X86_64.7z"
+              $url = "$repo/$($module.Package)/$build$archive"
+              curl.exe --fail --location --silent --show-error --retry 3 --retry-all-errors --connect-timeout 20 --max-time 180 --output $archive $url
+              if ($LASTEXITCODE -ne 0) { throw "Could not download $($module.Name) from Qt" }
+              if ((Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash -ne $module.SHA256) {
+                throw "SHA-256 mismatch for $($module.Name)"
+              }
+              cmake -E tar xf $archive
+              if ($LASTEXITCODE -ne 0) { throw "Could not extract $($module.Name)" }
+            }
+          } finally {
+            Pop-Location
+          }
+          "GTR_QT_SDK=$sdk" >> $env:GITHUB_ENV
       - run: python -m ruff check --isolated gtr tests packaging
       - run: python -m pytest --tb=short
       - run: python -m gtr --version
