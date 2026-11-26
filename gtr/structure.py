@@ -166,15 +166,29 @@ def safe_note(value):
     return text.translate(str.maketrans({"<": "‹", ">": "›", "[": "［", "]": "］", "(": "（", ")": "）", "\x00": ""}))
 
 
-def historical_notes(meta):
+NOTE_MODES = {"local", "compact", "detailed"}
+NOTE_LANGUAGES = {"ru", "uk"}
+
+
+def historical_notes(meta, mode="detailed", language="ru"):
     """Explicitly selected plaintext. Resolved/current names and IDs are never used."""
+    if mode == "local":
+        return {}
     result = {}
+    uk = language == "uk"
     source = forward_from_meta(meta)
-    if source.is_forwarded and (author := safe_note(source.historical_sender_name)):
-        privacy = " (профиль скрыт)" if source.privacy_state == "hidden" else ""
-        result["forward"] = f"[Историческая пометка gTR] Переслано от {author}{privacy}"
-    if quote := safe_note(meta.get("quote")):
-        result["quote"] = f"[Историческая цитата gTR] {quote}"
+    author = safe_note(source.historical_sender_name)
+    if source.is_forwarded and author:
+        privacy = (" (профіль приховано)" if uk else " (профиль скрыт)") if source.privacy_state == "hidden" else ""
+        label = "Переслано від" if uk else "Переслано от"
+        if mode == "compact":
+            result["forward"] = f"[{label} {author}{privacy} · gTR]"
+        else:
+            prefix = "[Історична позначка gTR]" if uk else "[Историческая пометка gTR]"
+            result["forward"] = f"{prefix} {label} {author}{privacy}"
+    if mode == "detailed" and (quote := safe_note(meta.get("quote"))):
+        prefix = "[Історична цитата gTR]" if uk else "[Историческая цитата gTR]"
+        result["quote"] = f"{prefix} {quote}"
     return result
 
 

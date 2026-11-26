@@ -63,6 +63,8 @@ def identify(name: str, header: bytes) -> tuple[str, bool]:
         return ("video/webm" if b"webm" in header.lower() else "video/x-matroska"), True
     if header.startswith(b"\x1f\x8b"):
         return ("application/x-tgsticker" if ext == ".tgs" else "application/gzip"), True
+    if len(header) >= 7 and header[0] == 255 and header[1] & 0xF6 == 0xF0:
+        return "audio/aac", True
     if len(header) >= 2 and header[0] == 255 and header[1] & 0xE0 == 0xE0:
         return "audio/mpeg", True
     return EXT_MIME.get(ext) or mimetypes.guess_type(name)[0] or "application/octet-stream", False

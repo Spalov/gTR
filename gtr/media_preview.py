@@ -12,7 +12,7 @@ from PySide6.QtGui import QColor, QImage, QImageReader, QPainter, QPen
 from .files import local
 from .media_engine import HEADER_BYTES, PICTURE_TYPES, inspect
 from .model import RecoveryError, quiet
-from .video import DEMUXERS, _input, _run
+from .video import DEMUXERS, _input, _run, gge_probe
 
 MAX_PIXELS = 16_000_000
 MAX_FRAME_BYTES = 1024 * 1024
@@ -52,6 +52,14 @@ def _scaled_image(reader):
         return QImage()
     reader.setScaledSize(size.scaled(QSize(640, 420), Qt.AspectRatioMode.KeepAspectRatio))
     return reader.read()
+
+
+def _decode_preview(data):
+    if not data or len(data) > MAX_FRAME_BYTES or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return QImage()
+    buffer = QBuffer()
+    buffer.setData(QByteArray(data))
+    return _scaled_image(QImageReader(buffer)) if buffer.open(QIODevice.OpenModeFlag.ReadOnly) else QImage()
 
 
 def _waveform(path):
@@ -95,14 +103,14 @@ def preview(path, expected_hash, declared_mime=None, *, provider=None, progress=
     picture = QImage()
     if facts.mime in PICTURE_TYPES and "corrupt_container" not in facts.issues:
         picture = _scaled_image(QImageReader(str(path)))
+        if picture.isNull():
+            picture = _decode_preview(gge_probe(path, "image", progress))
     elif facts.mime == "audio/wav" and "corrupt_container" not in facts.issues:
         picture = _waveform(path)
-    elif provider and facts.mime in VIDEO_MIME and "corrupt_container" not in facts.issues:
-        data = provider.frame(path, facts.mime)
-        if data and len(data) <= MAX_FRAME_BYTES and data.startswith(b"\x89PNG\r\n\x1a\n"):
-            buffer = QBuffer()
-            buffer.setData(QByteArray(data))
-            if buffer.open(QIODevice.OpenModeFlag.ReadOnly):
-                picture = _scaled_image(QImageReader(buffer))
+    elif facts.mime in VIDEO_MIME and "corrupt_container" not in facts.issues:
+        data = gge_probe(path, "poster", progress)
+        if data is None and provider:
+            data = provider.frame(path, facts.mime)
+        picture = _decode_preview(data)
     progress("inspect_media", 1, 1)
     return facts, picture

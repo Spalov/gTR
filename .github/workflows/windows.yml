@@ -10,7 +10,14 @@ jobs:
           python-version: '3.14.10'
           architecture: x64
       - run: python -m pip install -r requirements-win64.txt
+      - name: Set up Qt MSVC x64
+        shell: pwsh
+        run: |
+          python -m pip install aqtinstall
+          python -m aqt install-qt windows desktop 6.12.0 win64_msvc2022_64 -m qtmultimedia -O build\qt
+          "GTR_QT_SDK=$PWD\build\qt\6.12.0\msvc2022_64" >> $env:GITHUB_ENV
       - run: python -m ruff check --isolated gtr tests packaging
       - run: python -m pytest --tb=short
       - run: python -m gtr --version
       - run: python packaging/build_release.py --archives-only
+      - run: python packaging/audit_beta6.py

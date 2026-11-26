@@ -16,7 +16,7 @@ MARKER = re.compile(r"<attached:\s*([^>\r\n]+)>", re.IGNORECASE)
 ANDROID_MARKER = re.compile(r"([^<>\r\n]+) \(file attached\)")
 
 
-def wire_line(profile, date, author, body, asset=None):
+def wire_line(profile, date, author, body, asset=None, *, bound=False):
     if profile == PROFILES["android"]:
         if not 2000 <= date.year <= 2099:
             from .model import RecoveryError
@@ -26,7 +26,7 @@ def wire_line(profile, date, author, body, asset=None):
         marker = f"{asset} (file attached)" if asset else ""
     else:
         prefix = f"[{date:%d/%m/%Y, %H:%M:%S}] {author}: "
-        marker = f"<attached: {asset}>" if asset else ""
+        marker = (("\u200e" if bound else "") + f"<attached: {asset}>") if asset else ""
     return prefix + (marker + ("\n" if body else "") if marker else "") + body + "\n"
 
 
@@ -51,5 +51,5 @@ def read_records(stream, profile):
 def _record(date, author, parts, attached):
     body = "".join(parts).removesuffix("\n")
     first, _, rest = body.partition("\n")
-    marker = attached.fullmatch(first)
+    marker = attached.fullmatch(first.removeprefix("\u200e"))
     return date, author, rest if marker else body, marker[1] if marker else ""

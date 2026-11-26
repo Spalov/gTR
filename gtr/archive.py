@@ -10,6 +10,7 @@ from ctypes.util import find_library
 from pathlib import Path
 
 from .files import BLOCK, digest, is_link, local, name_key, safe_parts
+from .gge_io import preflight_zip
 from .media import identify
 from .model import FileInfo, Progress, RecoveryError, Snapshot, quiet
 
@@ -57,20 +58,26 @@ def selected_entries(root, names):
 
 
 def zip_entries(path):
-    with zipfile.ZipFile(path) as archive:
-        for entry in archive.infolist():
-            mode = entry.external_attr >> 16
-            if (
-                entry.flag_bits & 1
-                or stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)
-                or entry.external_attr & 0x400
-            ):
-                raise RecoveryError("Зашифрованные файлы, ссылки и специальные записи не поддерживаются.")
-            if entry.is_dir():
-                yield entry.filename.rstrip("/"), None, ()
-            else:
-                with archive.open(entry) as stream:
-                    yield entry.filename, entry.file_size, stream_chunks(stream)
+    with path.open("rb") as source:
+        preflight_zip(source, max_entries=MAX_FILES)
+        with zipfile.ZipFile(source) as archive:
+            yield from _zip_members(archive)
+
+
+def _zip_members(archive):
+    for entry in archive.infolist():
+        mode = entry.external_attr >> 16
+        if (
+            entry.flag_bits & 1
+            or stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR)
+            or entry.external_attr & 0x400
+        ):
+            raise RecoveryError("Зашифрованные файлы, ссылки и специальные записи не поддерживаются.")
+        if entry.is_dir():
+            yield entry.filename.rstrip("/"), None, ()
+        else:
+            with archive.open(entry) as stream:
+                yield entry.filename, entry.file_size, stream_chunks(stream)
 
 
 def rar_entries(path):

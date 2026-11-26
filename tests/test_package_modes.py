@@ -13,6 +13,7 @@ from gtr.importer import ImportController
 from gtr.integrity import check_local
 from gtr.mock_api import MockAPI, offline_result
 from gtr.model import Cancelled, RecoveryError
+from gtr.profiles import read_records
 
 
 def test_text_only_keeps_captions_and_documents_every_omission(project, bundle, tmp_path):
@@ -38,7 +39,12 @@ def test_separate_document_representation_keeps_bytes_and_binds_manifest(project
     first, same_content = bundle.data["media"][0], docs.data["media"][0]
     assert first["upload_as"] == "photo" and same_content["upload_as"] == "document"
     assert same_content["force_file"] and same_content["sha256"] == first["sha256"]
-    assert bundle.transcript.read_bytes() == docs.transcript.read_bytes()
+    with bundle.transcript.open(encoding="utf-8") as a, docs.transcript.open(encoding="utf-8") as b:
+        first_records = list(read_records(a, bundle.data["profile"]))
+        doc_records = list(read_records(b, docs.data["profile"]))
+    assert [row[:3] for row in first_records] == [row[:3] for row in doc_records]
+    assert first["attachment_id"] == same_content["attachment_id"]
+    assert first_records[2][3] == first["wire_name"] != same_content["wire_name"] == doc_records[2][3]
     assert docs.fingerprint() != bundle.fingerprint() and check_local(docs, project)["status"] == "verified"
 
 

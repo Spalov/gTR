@@ -57,14 +57,14 @@ def app_windows(runtime):
 
 
 def open_gui(command, folder, env):
-    runtime = folder / "runtime" / "pythonw.exe"
-    previous = app_windows(runtime)
+    runtimes = (folder / "runtime/pythonw.exe", folder / "runtime/Lib/site-packages/PySide6/gTR-shell.exe")
+    previous = set().union(*(app_windows(runtime) for runtime in runtimes))
     with subprocess.Popen(
         command, cwd=folder, env=env, creationflags=subprocess.CREATE_NO_WINDOW
     ) as launcher:
         deadline = monotonic() + 18
         while monotonic() < deadline:
-            if windows := app_windows(runtime) - previous:
+            if windows := set().union(*(app_windows(runtime) for runtime in runtimes)) - previous:
                 for hwnd in windows:
                     win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
                 for _ in range(40):
@@ -96,6 +96,9 @@ def check(folder, work, suite):
         print("gTR.exe blocked by Windows Application Control (4551)", flush=True)
     assert open_gui(shell, folder, env) == 0
     print("gTR.cmd opened and closed its Qt window", flush=True)
+    classic = [str(folder / "runtime/pythonw.exe"), "-m", "gtr", "classic"]
+    assert open_gui(classic, folder, env) == 0
+    print("The classic fallback opened and closed its Qt window", flush=True)
     if suite:
         import pytest
 
@@ -128,7 +131,8 @@ from gtr import BETA_FIX, BETA_NUMBER, __version__, updates
 file = Path(sys.argv[1])
 with file.open("rb") as stream:
     digest = file_digest(stream, "sha256").hexdigest()
-previous_beta = (BETA_NUMBER if BETA_FIX else BETA_NUMBER - 1, False)
+previous_beta = (BETA_NUMBER, False) if BETA_FIX else (BETA_NUMBER - 1, True)
+assert updates.candidate(file, (BETA_NUMBER - 1, False)) is not None
 project = updates.app_home() / "projects" / "synthetic.txt"
 project.parent.mkdir(parents=True)
 project.write_text("existing local data")

@@ -1889,8 +1889,9 @@ def application():
     return app
 
 
-def launch(project=None):
-    if updates.portable() and not os.environ.get(updates.BOOT_ENV) and (installed := updates.installed_update()):
+def launch(project=None, *, bundle=None, section=None, classic=False):
+    if (not classic and updates.portable() and not os.environ.get(updates.BOOT_ENV)
+            and (installed := updates.installed_update())):
         try:
             updates.launch(installed, project)
             return 0
@@ -1899,6 +1900,14 @@ def launch(project=None):
     app = application()
     window = Window(project)
     window.show()
+    if section == "history":
+        window.show_import_history()
+    elif section in {"telegram", "settings", "import"}:
+        window.navigate_to({"telegram": Section.TELEGRAM, "settings": Section.SETTINGS, "import": Section.IMPORT}[section])
+    if bundle:
+        window.run_job(
+            tr("Проверка пакета"), lambda progress: load_bundle(bundle, progress), window.use_bundle,
+        )
     if os.environ.get(updates.BOOT_ENV):
         QTimer.singleShot(0, updates.signal_ready)
     status = app.exec()

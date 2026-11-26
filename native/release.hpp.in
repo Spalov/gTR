@@ -1,0 +1,3 @@
+#pragma once
+
+#define GTR_RELEASE_LABEL "Beta @GTR_BETA_NUMBER@@GTR_FIX_LABEL@"

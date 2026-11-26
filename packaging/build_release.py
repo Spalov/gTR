@@ -46,6 +46,12 @@ PACKAGES = (
     "pywin32",
 )
 LOCAL_METADATA = {"direct_url.json", "INSTALLER", "RECORD", "REQUESTED"}
+QT_VERSION = "6.12.0"
+QT_RUNTIME = (
+    ("bin/Qt6Multimedia.dll", "Qt6Multimedia.dll"),
+    ("bin/Qt6MultimediaWidgets.dll", "Qt6MultimediaWidgets.dll"),
+    ("plugins/multimedia/windowsmediaplugin.dll", "plugins/multimedia/windowsmediaplugin.dll"),
+)
 
 
 def archive_entry(package, name, source):
@@ -107,6 +113,16 @@ def app_files():
                 "DATABASE_MIGRATION.md",
                 "SECURITY_AUDIT.md",
                 "BETA_5_TEST_PLAN.md",
+                "HYBRID_ARCHITECTURE.md",
+                "CPP_SHELL.md",
+                "IPC_PROTOCOL.md",
+                "MEDIA_ENGINE.md",
+                "ATTACHMENT_BINDING.md",
+                "FORWARD_RECOVERY.md",
+                "CLIENT_COMPATIBILITY.md",
+                "BENCHMARKS.md",
+                "BETA_6_TEST_PLAN.md",
+                "GGE_PROVENANCE.md",
             )
         ),
     ]
@@ -124,7 +140,12 @@ def source_archive(path):
         ROOT / "packaging/benchmark_recovery.py",
         ROOT / "packaging/make_icon.py",
         ROOT / "packaging/smoke_release.py",
-        ROOT / "packaging" / "Launcher.cs",
+        ROOT / "packaging/audit_beta6.py",
+        ROOT / "native/CMakeLists.txt",
+        *ROOT.glob("native/*.cpp"),
+        *ROOT.glob("native/*.hpp"),
+        ROOT / "native/release.hpp.in",
+        ROOT / "native/windows.rc.in",
         *ROOT.glob(".github/workflows/*.yml"),
     ]
     with ZipFile(path, "w") as package:
@@ -215,7 +236,40 @@ def sign_launcher(target, sign_tool, thumbprint, timestamp_url):
     subprocess.run([str(sign_tool), "verify", "/pa", "/tw", str(target)], check=True)
 
 
-def portable_archive(path, runtime, launcher=None):
+def build_native(sdk, *, allow_blocked_test=False):
+    sdk = sdk.resolve()
+    if not (sdk / "lib/cmake/Qt6/Qt6Config.cmake").is_file():
+        raise SystemExit(f"Install Qt {QT_VERSION} MSVC x64 with Qt Multimedia or specify --qt-sdk.")
+    version = sdk / "lib/cmake/Qt6/Qt6ConfigVersionImpl.cmake"
+    if f'set(PACKAGE_VERSION "{QT_VERSION}")' not in version.read_text(encoding="utf-8"):
+        raise SystemExit(f"Use the Qt SDK version {QT_VERSION} from requirements-win64.txt.")
+    for source, _ in QT_RUNTIME:
+        if not (sdk / source).is_file():
+            raise SystemExit("Qt Multimedia with the Windows backend is required.")
+    work = ROOT / "build/beta6-native"
+    test_python = ROOT / ".venv/Scripts/python.exe"
+    if not test_python.is_file():
+        test_python = Path(sys.executable)
+    subprocess.run(
+        ["cmake", "-S", str(ROOT / "native"), "-B", str(work), "-G", "Visual Studio 17 2022", "-A", "x64",
+         f"-DCMAKE_PREFIX_PATH={sdk}", f"-DGTR_TEST_PYTHON={test_python}"],
+        check=True,
+    )
+    subprocess.run(["cmake", "--build", str(work), "--config", "Release", "--parallel", "8"], check=True)
+    if allow_blocked_test:
+        env = {**os.environ, "PATH": str(sdk / "bin") + os.pathsep + os.environ["PATH"]}
+        try:
+            subprocess.run([str(work / "Release/protocol-test.exe")], check=True, env=env)
+        except OSError as error:
+            if error.winerror != 4551:
+                raise
+            print("Windows Application Control (4551) blocked the C++ test. Native runtime remains unverified.")
+            return work / "Release"
+    subprocess.run(["ctest", "--test-dir", str(work), "-C", "Release", "--output-on-failure"], check=True)
+    return work / "Release"
+
+
+def portable_archive(path, runtime, launcher=None, shell=None, sdk=None):
     expected_python = tuple(map(int, PYTHON_VERSION.split(".")))
     if sys.platform != "win32" or sys.version_info[:3] != expected_python or sys.maxsize < 2**32:
         raise SystemExit(f"The portable build requires 64-bit CPython {PYTHON_VERSION} on Windows.")
@@ -237,6 +291,17 @@ def portable_archive(path, runtime, launcher=None):
     with ZipFile(path, "w") as package:
         if launcher:
             archive_file(package, "gTR.exe", launcher)
+        if shell:
+            qt = "runtime/Lib/site-packages/PySide6/"
+            archive_file(package, qt + "gTR-shell.exe", shell)
+            archive_entry(package, qt + "qt.conf", io.BytesIO(b"[Paths]\nPrefix=.\nPlugins=plugins\nTranslations=translations\n"))
+            for source, name in QT_RUNTIME:
+                archive_file(package, qt + name, sdk / source)
+        shippable = {
+            entry.as_posix()
+            for installed in distributions
+            for entry in installed.files
+        }
         for file in sorted(app_files()):
             archive_file(package, file.relative_to(ROOT).as_posix(), file)
         with ZipFile(runtime) as python:
@@ -244,6 +309,10 @@ def portable_archive(path, runtime, launcher=None):
                 if entry.filename != "python314._pth":
                     with python.open(entry) as source:
                         archive_entry(package, "runtime/" + entry.filename, source)
+                    if (shell and entry.filename in {"vcruntime140.dll", "vcruntime140_1.dll"}
+                            and "PySide6/" + entry.filename not in shippable):
+                        with python.open(entry) as source:
+                            archive_entry(package, qt + entry.filename, source)
         archive_entry(
             package,
             "runtime/python314._pth",
@@ -308,7 +377,9 @@ if __name__ == "__main__":
     parser.add_argument("--baseline-source", type=Path, help="Create a patch against the specified legacy ZIP")
     parser.add_argument("--archives-only", action="store_true", help="Build ZIPs without generating a baseline patch")
     parser.add_argument("--without-exe", action="store_true")
-    parser.add_argument("--compiler", type=Path)
+    parser.add_argument("--qt-sdk", type=Path, default=Path(os.environ.get("GTR_QT_SDK") or ROOT / "build/beta6-qt-sdk"))
+    parser.add_argument("--allow-blocked-native-test", action="store_true",
+                        help="Build local archives if Windows Application Control blocks the test executable")
     parser.add_argument("--sign-tool", type=Path)
     parser.add_argument("--certificate-thumbprint")
     parser.add_argument("--timestamp-url")
@@ -331,11 +402,16 @@ if __name__ == "__main__":
         if not args.source_only:
             portable = Path(tmp) / f"{NAME}-Windows-x64.zip"
             launcher = Path(tmp) / "gTR.exe" if not args.without_exe else None
+            shell = None
             if launcher:
-                compile_launcher(launcher, args.compiler)
+                compiled = build_native(args.qt_sdk, allow_blocked_test=args.allow_blocked_native_test)
+                shutil.copyfile(compiled / "gTR.exe", launcher)
+                shell = Path(tmp) / "gTR-shell.exe"
+                shutil.copyfile(compiled / "gTR-shell.exe", shell)
                 if all(signing):
                     sign_launcher(launcher, *signing)
-            portable_archive(portable, args.python_embed, launcher)
+                    sign_launcher(shell, *signing)
+            portable_archive(portable, args.python_embed, launcher, shell, args.qt_sdk)
         if not args.portable_only:
             source = Path(tmp) / f"{NAME}-source.zip"
             source_archive(source)

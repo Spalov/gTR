@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .bindings import UNRESOLVED, AttachmentBindingError, requested_kind
 from .conversion import Bundle, load_bundle, owner_copy
 from .faults import AMBIGUOUS_RPC, FAULTS, RESTRICTIONS, UNSUPPORTED, ImportFault
 from .filenames import safe_filename
@@ -85,7 +86,9 @@ def _media_attempt(index, total, item, record, facts=None):
         "ended_at": None,
         "error_code": None,
         "response_constructor": None,
-        "requested_kind": item["kind"] if item.get("attributes") or item["upload_as"] == "photo" else "document",
+        "requested_kind": requested_kind(item),
+        "binding_state": "LOCAL_VALIDATED",
+        **({"attachment_id": item["attachment_id"]} if "attachment_id" in item else {}),
         "received_kind": None,
         "local_issues": facts["issues"] if facts is not None else (),
     }
@@ -134,6 +137,8 @@ class ImportController:
         self.close()
 
     def _problem(self, error, *, init_sent=False, staged=False, reserved=False):
+        if isinstance(error, AttachmentBindingError):
+            error = ImportFault(UNRESOLVED, stage=self.stage)
         cancelled = isinstance(error, (Cancelled, asyncio.CancelledError, KeyboardInterrupt))
         fault = (
             error.at(self.stage)
@@ -287,7 +292,7 @@ class ImportController:
                 fault = self._problem(error)
             finally:
                 self.close()
-            if isinstance(error, RecoveryError) and not isinstance(error, ImportFault):
+            if isinstance(error, RecoveryError) and not isinstance(error, (ImportFault, AttachmentBindingError)):
                 raise
             raise fault from None
 
@@ -339,7 +344,8 @@ class ImportController:
                 self.journal.finish_media(self.job, attempt)
             raise
         attempt.update(
-            status="MEDIA_ACCEPTED", ended_at=timestamp(), response_constructor=safe_constructor(constructor)
+            status="MEDIA_ACCEPTED", ended_at=timestamp(), response_constructor=safe_constructor(constructor),
+            binding_state="AWAITING_OBSERVATION",
         )
         if self.journal and self.job:
             self.journal.finish_media(self.job, attempt)

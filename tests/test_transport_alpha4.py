@@ -50,7 +50,7 @@ class FakeTelegram:
                 if isinstance(request.media, types.InputMediaUploadedPhoto):
                     return types.MessageMediaPhoto(photo=types.Photo(51, 0, b"", None, [], 0))
                 return types.MessageMediaDocument(
-                    document=types.Document(57, 0, b"", None, request.media.mime_type, 1, 0, [])
+                    document=types.Document(57, 0, b"", None, request.media.mime_type, 1, 0, request.media.attributes)
                 )
             case "StartHistoryImportRequest":
                 return True

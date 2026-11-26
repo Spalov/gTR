@@ -14,6 +14,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .archive import MAX_TOTAL_BYTES
+from .bindings import VERSION as BINDING_VERSION
+from .bindings import AttachmentBindingError, bind, check_binding, wire_name
 from .core import ISSUES, catalogue, encode, properties
 from .filenames import assign_names, safe_filename
 from .files import (
@@ -43,7 +45,13 @@ from .model import RecoveryError, quiet
 from .payloads import STRUCTURED, plan_media, publish_media, validate_media_input
 from .profiles import MARKER, MEDIA_NAME, PROFILES, read_records, wire_line
 from .selection import decode_intervals, difference, included_intervals
-from .structure import annotated_text, historical_notes, local_structure
+from .structure import (
+    NOTE_LANGUAGES,
+    NOTE_MODES,
+    annotated_text,
+    historical_notes,
+    local_structure,
+)
 from .video import VIDEO_KINDS, VIDEO_POLICIES, MediaTools, queue_video
 
 PROFILE = PROFILES["ios"]
@@ -233,7 +241,10 @@ def plan_import(
     video_decisions=None,
     media_queue=None,
     annotate=False,
+    annotation_mode="detailed",
+    annotation_language="ru",
     record_kind="all",
+    binding_version=BINDING_VERSION,
 ):
     """Build the same ledger for a read-only preview and for a published package."""
     try:
@@ -246,6 +257,9 @@ def plan_import(
         or media_mode not in MEDIA_MODES
         or video_policy not in (None, *VIDEO_POLICIES)
         or record_kind not in RECORD_KINDS
+        or binding_version not in (0, BINDING_VERSION)
+        or annotation_mode not in NOTE_MODES
+        or annotation_language not in NOTE_LANGUAGES
         or (sample is not None and sample < 1)
         or type(first_record) is not int
         or not 1 <= first_record <= 2**31 - 1
@@ -394,6 +408,8 @@ def plan_import(
                         notes.append("audio_unreadable")
                     else:
                         notes.append("audio_unconfirmed")
+                        if binding_version:
+                            item.update(attributes={}, representation="document", force_file=True)
                 if not reason and not body and not item:
                     reason = "empty"
             date, change = (
@@ -446,17 +462,18 @@ def plan_import(
             else:
                 if item:
                     assign_names(item, meta, used_names)
+                    if binding_version:
+                        bind(source_hash, chat_id, record, item, len(media) + 1, date, profile)
                 if not row["source_id"]:
                     notes.append("missing_source_id")
                 if change:
                     notes.append(change)
-                annotations = historical_notes(meta) if annotate else {}
+                annotations = historical_notes(meta, annotation_mode, annotation_language) if annotate else {}
                 if annotations:
                     record["annotations"] = annotations
                 wire_body = annotated_text(body, annotations)
-                line = wire_line(profile, date, row["sender"], wire_body, item["name"] if item else None).encode(
-                    "utf-8"
-                )
+                line = wire_line(profile, date, row["sender"], wire_body, wire_name(item) if item else None,
+                                 bound=bool(binding_version)).encode("utf-8")
                 text_hash.update(line)
                 if write_line is not None:
                     write_line(line)
@@ -475,6 +492,7 @@ def plan_import(
     return {
         "schema": 3,
         "filename_version": 1,
+        **({"binding_version": binding_version} if binding_version else {}),
         "source_conversation": source_props.get(f"chat_peer:{chat_id}", ""),
         "source_title_unique": title_unique,
         "profile": profile,
@@ -487,6 +505,8 @@ def plan_import(
         **({"video_decisions": video_decisions} if video_decisions else {}),
         **({"media_decisions_required": media_queue.entries} if media_queue.entries else {}),
         **({"annotate": True} if annotate else {}),
+        **({"annotation_mode": annotation_mode, "annotation_language": annotation_language}
+           if annotate and (annotation_mode, annotation_language) != ("detailed", "ru") else {}),
         "album_count": len(album_ids),
         "media_count": len(media),
         "source_records": total,
@@ -544,7 +564,10 @@ def prepare(
     video_decisions=None,
     media_queue=None,
     annotate=False,
+    annotation_mode="detailed",
+    annotation_language="ru",
     record_kind="all",
+    binding_version=BINDING_VERSION,
 ):
     from .reports import package_html
 
@@ -577,7 +600,10 @@ def prepare(
                 video_decisions=video_decisions,
                 media_queue=media_queue,
                 annotate=annotate,
+                annotation_mode=annotation_mode,
+                annotation_language=annotation_language,
                 record_kind=record_kind,
+                binding_version=binding_version,
             )
         if data.get("media_decisions_required"):
             raise MediaDecisionRequired(data["media_decisions_required"])
@@ -667,6 +693,8 @@ def prepare_eligible(
         media_queue=media_queue,
         media_tools=media_tools,
         annotate=bundle.data.get("annotate", False),
+        annotation_mode=bundle.data.get("annotation_mode", "detailed"),
+        annotation_language=bundle.data.get("annotation_language", "ru"),
         record_kind=bundle.data.get("selection", {}).get("record_kind", "all"),
     )
 
@@ -713,6 +741,11 @@ def load_bundle(root, progress=quiet):
         if "test_reset_id" in data and (type(data["test_reset_id"]) is not int or data["test_reset_id"] < 0):
             raise ValueError
         modern = "media_mode" in data
+        binding = data.get("binding_version", 0)
+        if type(binding) is not int or binding not in (0, BINDING_VERSION):
+            raise AttachmentBindingError()
+        if binding and not data.get("filename_version"):
+            raise AttachmentBindingError()
         if "filename_version" in data:
             if type(data.get("source_title_unique", True)) is not bool or not re.fullmatch(
                 r"(?:(?:user|chat|channel)-?[1-9]\d{0,18})?", data.get("source_conversation", "")
@@ -793,7 +826,7 @@ def load_bundle(root, progress=quiet):
                 raise ValueError
             if "ranges" in selection and decode_intervals(selection["ranges"]) != bundle.record_intervals():
                 raise ValueError
-        names, stored, planned = set(), set(), []
+        names, stored, planned, media_by_name = set(), set(), [], {}
         total_bytes = 0
         for i, item in enumerate(data["media"], 1):
             progress("verify", i, len(data["media"]))
@@ -844,15 +877,19 @@ def load_bundle(root, progress=quiet):
                 or item.get("attributes", {}).get("video_codec") != "h264"
             ):
                 raise ValueError
-            validate_media_input(item, path, strict=modern)
-            if (
-                path.stat().st_size != item["size"]
-                or digest(path, lambda i=i: progress("verify", i, len(data["media"]))) != item["sha256"]
-            ):
-                raise ValueError
+            try:
+                validate_media_input(item, path, strict=modern)
+                if (path.stat().st_size != item["size"]
+                        or digest(path, lambda i=i: progress("verify", i, len(data["media"]))) != item["sha256"]):
+                    raise ValueError
+            except (ValueError, OSError):
+                if binding:
+                    raise AttachmentBindingError() from None
+                raise
             names.add(name.casefold())
             stored.add(item.get("storage_name", name))
-            planned.append(name)
+            planned.append(wire_name(item))
+            media_by_name[name] = (i, item)
         markers, headers = [], 0
         expected = iter(r for r in data["records"] if r["included"])
         previous_position, previous_date = 0, ""
@@ -864,11 +901,19 @@ def load_bundle(root, progress=quiet):
                 if mode == "text_only" and not body.strip():
                     raise ValueError
                 row = next(expected, None)
-                if row is None or (
+                if not row:
+                    raise ValueError
+                media_reference = row.get("media", "")
+                asset = media_by_name.get(media_reference)
+                expected_marker = wire_name(asset[1]) if asset else media_reference
+                if binding and (name != expected_marker or (media_reference and not asset)
+                                or (not asset and "attachment_id" in row)):
+                    raise AttachmentBindingError()
+                if (
                     data["schema"] >= 2
                     and (
                         row["author"] != author
-                        or row.get("media", "") != name
+                        or expected_marker != name
                         or row["text_sha256"] != hashlib.sha256(body.encode("utf-8")).hexdigest()
                     )
                 ):
@@ -876,6 +921,8 @@ def load_bundle(root, progress=quiet):
                 if data["schema"] >= 2:
                     wire_fmt = "%d/%m/%Y, %H:%M:%S" if data["profile"] == PROFILE else "%d/%m/%y, %H:%M:%S"
                     date = datetime.fromisoformat(row["import_date"])
+                    if binding and asset:
+                        check_binding(data, row, asset[1], asset[0], date)
                     if (
                         date.strftime(wire_fmt) != wire_date
                         or (
@@ -888,11 +935,14 @@ def load_bundle(root, progress=quiet):
                     ):
                         raise ValueError
                     previous_date, previous_position = row["import_date"], row["source_ordinal"]
+        marker_mismatch = len(markers) != len(names) or (
+            markers != planned if modern else {marker.casefold() for marker in markers} != names
+        )
+        if binding and (marker_mismatch or len(set(planned)) != len(planned)):
+            raise AttachmentBindingError()
         if (
             headers != data["included"]
-            or len(markers) != len(names)
-            or {marker.casefold() for marker in markers} != names
-            or (modern and markers != planned)
+            or marker_mismatch
             or sum(bool(r["included"]) for r in data["records"]) != headers
             or len(data["records"]) - headers != data["skipped"]
             or not isinstance(data["losses"], dict)

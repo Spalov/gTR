@@ -91,6 +91,8 @@ def fidelity_record(record, item=None, observed=(), paired=False):
         fields["date"] = fields["time"] = ERROR
     if any(a["status"] not in {"ok", "unconfirmed_type", "metadata"} for a in original_media):
         fields["attachments"] = ERROR
+    if any(row.get("binding_error") for row in observed):
+        fields["attachments"] = ERROR
     if carried and fields["attachments"] in {CONFIRMED, PARTIAL}:
         exact = _supported(True, True, observed, "media_bytes", paired)
         if item["upload_as"] == "photo" and exact == ERROR:

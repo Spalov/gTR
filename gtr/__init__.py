@@ -1,7 +1,7 @@
 """gTR by Gruzin."""
 
-BETA_NUMBER = 5
-BETA_FIX = True
+BETA_NUMBER = 6
+BETA_FIX = False
 BETA_VERSION = (BETA_NUMBER, BETA_FIX)
 
 

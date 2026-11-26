@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from time import monotonic
 
+from .bindings import UNRESOLVED, requested_kind, wire_name
 from .faults import FAULTS, ImportFault
 from .filenames import display_name
 
@@ -161,7 +162,7 @@ class TelegramAPI:
 
     async def upload_media_traced(self, peer, import_id, item, path, stage):
         stage("upload_file_parts")
-        name = display_name(item)
+        name = wire_name(item) if "wire_name" in item else display_name(item)
         started = last = monotonic()
         report = getattr(stage, "upload_bytes", None)
 
@@ -174,13 +175,15 @@ class TelegramAPI:
 
         file = await self.upload_file(path, name, progress if report else None)
         stage("build_input_media")
+        if "wire_name" in item and getattr(file, "name", None) != name:
+            raise ImportFault(UNRESOLVED)
         media = self.input_media(file, item)
         stage("upload_imported_media")
         result = await self.rpc(
             self.messages.UploadImportedMediaRequest(
                 peer=peer,
                 import_id=import_id,
-                file_name=item["name"],
+                file_name=wire_name(item),
                 media=media,
             )
         )
@@ -198,8 +201,8 @@ class TelegramAPI:
         if on_response := getattr(stage, "response", None):
             on_response(actual)
         if (
-            item.get("attributes", {}).get("type") == "video"
-            and item["kind"] in VIDEO_KINDS and actual != item["kind"]
+            ("wire_name" in item or (item.get("attributes", {}).get("type") == "video" and item["kind"] in VIDEO_KINDS))
+            and actual != requested_kind(item)
         ):
             raise ImportFault("MEDIA_TYPE_CHANGED", response_constructor=constructor)
         return constructor

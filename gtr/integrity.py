@@ -124,7 +124,10 @@ def check_local(bundle, project: Path | None, progress=quiet) -> dict:
                 ):
                     differences.append({"code": "source_date", "ordinal": i})
                 sha = hashlib.sha256(original["text"].encode()).hexdigest()
-                notes = historical_notes(meta) if bundle.data.get("annotate") and record["included"] else {}
+                notes = historical_notes(
+                    meta, bundle.data.get("annotation_mode", "detailed"),
+                    bundle.data.get("annotation_language", "ru"),
+                ) if bundle.data.get("annotate") and record["included"] else {}
                 wire_sha = hashlib.sha256(annotated_text(original["text"], notes).encode()).hexdigest()
                 if sha != record["original_text_sha256"] or notes != record.get("annotations", {}) or (
                     record["included"] and wire_sha != record["text_sha256"]

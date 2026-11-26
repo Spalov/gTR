@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import perf_counter
+from time import perf_counter, process_time
 
 SIZES = (10, 100, 233, 1_000, 6_000, 10_000, 50_000, 100_000)
 
@@ -26,11 +26,15 @@ def peak_rss():
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * (1 if sys.platform == "darwin" else 1024)
 
 
-def run(count, media=False):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+def run(count, media=False, code=None):
+    startup = perf_counter()
+    cpu = process_time()
+    sys.path.insert(0, str(code or Path(__file__).resolve().parents[1]))
+    from gtr import __version__
     from gtr.conversion import load_bundle, plan_import, prepare
-    from gtr.core import analyze, summary
+    from gtr.core import analyze, catalogue, summary
     from gtr.integrity import check_local
+    startup = perf_counter() - startup
 
     with TemporaryDirectory(prefix="gtr-synthetic-benchmark-") as temporary:
         root = Path(temporary)
@@ -63,6 +67,14 @@ def run(count, media=False):
         catalog_seconds = perf_counter() - started
         assert summary(project)["messages"] == count
         started = perf_counter()
+        with catalogue(project) as db:
+            rows = db.execute(
+                "SELECT id FROM messages WHERE chat=1 AND instr(text, ?) > 0 ORDER BY id DESC LIMIT 80",
+                ("000001",),
+            ).fetchall()
+        assert len(rows) == 1
+        search = perf_counter() - started
+        started = perf_counter()
         plan = plan_import(project, 1)
         assert plan["included"] == count
         del plan
@@ -77,7 +89,9 @@ def run(count, media=False):
         assert check_local(prepared, project)["status"] == "verified"
         verify_seconds = perf_counter() - started
         return {
-            "records": count, "attachments": count if media else 0,
+            "release": __version__, "records": count, "attachments": count if media else 0,
+            "startup_s": round(startup, 3), "search_ms": round(search * 1000, 2),
+            "cpu_s": round(process_time() - cpu, 2),
             "analyze_s": round(catalog_seconds, 2), "plan_s": round(plan_seconds, 2),
             "package_s": round(package_seconds, 2), "verify_s": round(verify_seconds, 2),
             "peak_mib": round(peak_rss() / 1024**2, 1), "input_mib": round(input_bytes / 1024**2, 2),
@@ -89,9 +103,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--size", type=int, choices=(*SIZES, 32))
     parser.add_argument("--with-media", action="store_true")
+    parser.add_argument("--code", type=Path, help="Source tree to benchmark")
     args = parser.parse_args()
     if args.size is not None:
-        print(json.dumps(run(args.size, args.with_media)), flush=True)
+        print(json.dumps(run(args.size, args.with_media, args.code)), flush=True)
         return
     for size in SIZES + (32,):
         flags = ["--with-media"] if size == 32 else []

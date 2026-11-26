@@ -15,7 +15,7 @@ from time import monotonic, sleep
 from .files import BLOCK, digest, local, private_directory
 from .model import RecoveryError
 
-DECISIONS = {"compatible", "original", "document", "skip", "reencode"}
+DECISIONS = {"compatible", "original", "document", "skip", "reencode", "remux", "fidelity", "compact"}
 CACHE_PROFILE = "mp4-h264-aac-remux-crf18-autorotate-sar-v1"
 CACHE_KEY = re.compile(r"[a-f0-9]{64}")
 CACHE_TEMP = ".gtr-media-"
@@ -160,13 +160,15 @@ def cache_info():
     return {"size": size, "files": count}
 
 
-def clean_cache():
+def clean_cache(progress=None):
     root = _cache_root()
     if not root.is_dir():
         return {"size": 0, "files": 0}
-    with _cache_lease(root):
+    with _cache_lease(root, progress):
         result = cache_info()
         for path in list(_cache_entries(root)):
+            if progress:
+                progress("media_cache_clean", 0, 0)
             _remove_owned(path)
         remaining = cache_info()
         return {key: result[key] - remaining[key] for key in result}
@@ -186,7 +188,7 @@ def _toolchain(tools):
     return _tool_state(tools.ffmpeg), _tool_state(tools.ffprobe)
 
 
-def _try_cache(root, tools, kind, original, progress):
+def _try_cache(root, tools, kind, original, progress, profile):
     from .video import compatible_copy_matches
 
     if not _owned(root):
@@ -200,7 +202,7 @@ def _try_cache(root, tools, kind, original, progress):
         if not CACHE_KEY.fullmatch(claim["sha256"]) or type(claim["size"]) is not int:
             return None
         actual = tools.analyze(path, kind, expected_size=claim["size"], expected_hash=claim["sha256"], progress=progress)
-        if claim.get("method") in {"remux", "transcode"} and compatible_copy_matches(actual, original):
+        if claim.get("method") in {"remux", "transcode"} and compatible_copy_matches(actual, original, profile=profile):
             return path, claim, replace(actual, method=claim["method"])
     except (OSError, KeyError, ValueError, TypeError):
         pass
@@ -283,7 +285,7 @@ class MediaQueue:
             )
         return self._probes[token]
 
-    def copy(self, tools, source, target, item, original, progress, *, force_transcode=False):
+    def copy(self, tools, source, target, item, original, progress, *, force_transcode=False, profile="compatible"):
         root = _cache_root()
         try:
             root.mkdir(parents=True)
@@ -291,7 +293,7 @@ class MediaQueue:
             pass
         else:
             private_directory(root)
-        keys = (CACHE_PROFILE, item["sha256"], item["kind"], _toolchain(tools), force_transcode)
+        keys = (CACHE_PROFILE, item["sha256"], item["kind"], _toolchain(tools), force_transcode, profile)
         cache_name = sha256(json.dumps(keys).encode("utf-8")).hexdigest()
         entry = local(root / cache_name)
         source = local(source)
@@ -302,7 +304,7 @@ class MediaQueue:
             raise RecoveryError("Оригинал видео изменился после анализа.")
         with _cache_lease(root, progress):
             self.emit("verify")
-            result = _try_cache(entry, tools, item["kind"], original, progress)
+            result = _try_cache(entry, tools, item["kind"], original, progress, profile)
             if result is None:
                 if entry.exists() and not _remove_owned(entry):
                     raise RecoveryError("Папка кеша занята файлами другого приложения.")
@@ -323,7 +325,7 @@ class MediaQueue:
                     output = work / "video.mp4"
                     actual = tools.compatibility_copy(
                         source, output, item["kind"], original, item["sha256"], report,
-                        force_transcode=force_transcode,
+                        force_transcode=force_transcode, **({"profile": profile} if profile != "compatible" else {}),
                     )
                     self.emit("verify")
                     claim = {"sha256": digest(output, checkpoint), "size": output.stat().st_size, "method": actual.method}

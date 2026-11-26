@@ -44,7 +44,7 @@ def test_unicode_display_marker_file_parts_and_document_attributes(tmp_path, pro
     assert check_local(bundle, p)["status"] == "verified"
     with bundle.transcript.open(encoding="utf-8") as stream:
         assert [r[3] for r in read_records(stream, bundle.data["profile"])] == [
-            x["name"] for x in bundle.data["media"]
+            x["wire_name"] for x in bundle.data["media"]
         ]
 
     class Wire(FakeTelegram):
@@ -71,9 +71,9 @@ def test_unicode_display_marker_file_parts_and_document_attributes(tmp_path, pro
     stage.upload_bytes = lambda *args: progress.append(args)
     for item in bundle.data["media"]:
         offline_result(api.upload_media_traced("target", 123, item, bundle.media_path(item), stage))
-    assert client.files == [x["display_name"] for x in bundle.data["media"]]
+    assert client.files == [x["wire_name"] for x in bundle.data["media"]]
     for item, request in zip(bundle.data["media"], client.wire):
-        assert request.file_name == item["name"] and request.media.file.name == item["display_name"]
+        assert request.file_name == request.media.file.name == item["wire_name"]
         assert request.media.attributes[0].file_name == item["display_name"]
         assert isinstance(request.media, types.InputMediaUploadedDocument)
     assert len(progress) == 3 and all(sent == size and speed >= 0 for _, sent, size, speed in progress)

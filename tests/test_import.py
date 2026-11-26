@@ -27,7 +27,7 @@ def test_profile_includes_dates_original_bytes_and_losses(bundle, synthetic):
     assert b.data["included"] == 10 and b.data["losses"]["rich_text"] == 1 and b.data["losses"]["reply"] == 1
     for item in b.data["media"]:
         assert b.media_path(item).read_bytes() == (synthetic / item["source"]).read_bytes()
-        assert text.count("<attached: " + item["name"] + ">") == 1
+        assert text.count("<attached: " + item["wire_name"] + ">") == 1
         assert hashlib.sha256(b.media_path(item).read_bytes()).hexdigest() == item["sha256"]
 
 
@@ -146,7 +146,7 @@ def test_real_tl_adapter_with_local_fake_client(bundle):
                     if isinstance(request.media, types.InputMediaUploadedPhoto):
                         return types.MessageMediaPhoto(photo=types.Photo(10, 0, b"", None, [], 0))
                     return types.MessageMediaDocument(
-                        document=types.Document(11, 0, b"", None, request.media.mime_type, 1, 0, [])
+                        document=types.Document(11, 0, b"", None, request.media.mime_type, 1, 0, request.media.attributes)
                     )
                 case "StartHistoryImportRequest":
                     return True
@@ -168,7 +168,7 @@ def test_real_tl_adapter_with_local_fake_client(bundle):
     assert isinstance(requests[4].media, types.InputMediaUploadedDocument)
     assert not requests[4].media.force_file
     assert requests[-2].media.force_file
-    assert all(r.file_name == f["name"] for r, f in zip(requests[3:-1], bundle.data["media"]))
+    assert all(r.file_name == r.media.file.name == f["wire_name"] for r, f in zip(requests[3:-1], bundle.data["media"]))
 
 
 def test_telethon_error_classification():

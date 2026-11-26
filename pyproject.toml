@@ -23,6 +23,7 @@ Releases = "https://github.com/Spalov/gTR/releases"
 
 [project.optional-dependencies]
 owner = ["Telethon>=1.40,<2"]
+media = ["av>=19,<20", "Pillow>=13,<14"]
 test = ["pytest>=8,<10"]
 
 [project.scripts]

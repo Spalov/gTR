@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .bindings import wire_name
 from .importer import ImportFault, run_import
 from .profiles import HEADERS, read_records
 from .verification import compare
@@ -96,9 +97,10 @@ class MockAPI:
     async def upload_media(self, peer, import_id, item, path):
         self.step("upload")
         self.check_id(peer, import_id)
-        if item["name"] not in self.expected - self.uploaded or path.stat().st_size != item["size"]:
+        name = wire_name(item)
+        if name not in self.expected - self.uploaded or path.stat().st_size != item["size"]:
             raise ImportFault("MEDIA_INVALID")
-        self.uploaded.add(item["name"])
+        self.uploaded.add(name)
 
     async def start(self, peer, import_id):
         self.check_id(peer, import_id)
@@ -114,7 +116,7 @@ class MockAPI:
         entries = [r for r in bundle.data["records"] if r["included"]]
         labels = list(dict.fromkeys(row["author"] for row in entries))
         mapping = {label: 100 + i % 2 for i, label in enumerate(labels)}
-        media_hashes = {item["name"]: item["sha256"] for item in bundle.data["media"]}
+        media_hashes = {wire_name(item): item["sha256"] for item in bundle.data["media"]}
         zone = ZoneInfo("UTC" if bundle.data["timezone"] == "source" else bundle.data["timezone"])
 
         def capture(account):

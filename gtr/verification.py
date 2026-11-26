@@ -6,6 +6,7 @@ from datetime import UTC, date, datetime
 from itertools import combinations
 from zoneinfo import ZoneInfo
 
+from .bindings import UNRESOLVED, digest_text, requested_kind, wire_name
 from .files import read_json
 from .integrity import check_local
 from .model import RecoveryError, quiet
@@ -19,6 +20,7 @@ FIELD_NAMES = {
     "out": "Признак «исходящее»",
     "imported": "Маркировка импорта",
     "attachment": "Наличие вложения",
+    "attachment_binding": "Связь вложения с сообщением",
     "media_access": "Чтение медиа с сервера",
     "media_bytes": "Совпадение байтов полученного медиа",
     "document_name": "Имя документа на сервере",
@@ -230,10 +232,23 @@ def _projections(features):
             yield shape, tuple(features[i] for i in shape)
 
 
-def _align(expected, actual, zone, media_hashes):
-    """Match unique text or unique metadata signatures, never native account fields."""
+def _align(expected, actual, zone, media_hashes, media):
+    """Match text, upload aliases and historical metadata without guessing native IDs."""
     want = [r["text_sha256"] for r in expected]
     got = [r.get("text_sha256") for r in actual]
+    aliases = {
+        digest_text(wire_name(media[row["media"]])): index
+        for index, row in enumerate(expected) if row.get("media") in media
+    }
+    for index, row in enumerate(actual):
+        marker = row.get("attachment_marker_sha256")
+        source = aliases.get(marker) if isinstance(marker, str) else None
+        if source is None or row.get("imported") is not True:
+            continue
+        item = expected[source]
+        if (row.get("imported_name") == item["author"]
+                and _stamp(row.get("original_date")) in {_original(item), _wire(item, zone)} - {None}):
+            want[source] = got[index] = "marker:" + marker
     want_counts, got_counts = Counter(want), Counter(got)
     source_groups, observed_groups = _positions(want), _positions(got)
     pairs = [(None, None)] * len(expected)
@@ -285,7 +300,7 @@ def _align(expected, actual, zone, media_hashes):
 
 def _view(expected, capture, authors, zone, media_hashes, media):
     rows = capture["messages"]
-    aligned, missing, extra, ambiguous = _align(expected, rows, zone, media_hashes)
+    aligned, missing, extra, ambiguous = _align(expected, rows, zone, media_hashes, media)
     id_counts = Counter(row["id"] for row in rows)
     source_to_server = {
         e["source_id"]: a["id"]
@@ -307,8 +322,13 @@ def _view(expected, capture, authors, zone, media_hashes, media):
         }
     )
     expected_hashes = {row["text_sha256"] for row in expected}
+    alias_hashes = {digest_text(wire_name(item)) for item in media.values()}
     evidence_candidates = sum(
-        row.get("imported") is True and row.get("text_sha256") in expected_hashes for row in rows
+        row.get("imported") is True and (
+            row.get("text_sha256") in expected_hashes or (
+                isinstance(row.get("attachment_marker_sha256"), str) and row["attachment_marker_sha256"] in alias_hashes
+            )
+        ) for row in rows
     )
     for i, (want, (position, got)) in enumerate(zip(expected, aligned), 1):
         if got is None or id_counts[got["id"]] != 1:
@@ -320,6 +340,9 @@ def _view(expected, capture, authors, zone, media_hashes, media):
         has = bool(want.get("media"))
         attachment = media.get(want.get("media"), {})
         is_document = attachment.get("upload_as") == "document"
+        marker = bool(attachment and got.get("attachment_marker_sha256") == digest_text(wire_name(attachment)))
+        bound = False if marker else got.get("has_media")
+        binding_error = has and bound is False
         from .filenames import display_name
         original = _original(want)
         server_id = got.get("from_id")
@@ -340,6 +363,7 @@ def _view(expected, capture, authors, zone, media_hashes, media):
             "out": (flag("out"), own),
             "imported": (flag("imported"), True),
             "attachment": (flag("has_media"), has),
+            "attachment_binding": (bound if type(bound) is bool else None, has),
             "media_access": (flag("media_accessible") if has else True, True),
             "media_bytes": (got.get("media_sha256"), media_hashes.get(want.get("media"))),
             "document_name": (got.get("document_name"), display_name(attachment) if is_document else None),
@@ -350,8 +374,7 @@ def _view(expected, capture, authors, zone, media_hashes, media):
             ),
             "media_kind": (
                 got.get("media_kind"),
-                (attachment.get("kind") if attachment.get("attributes") or not is_document else "document")
-                if has else None,
+                requested_kind(attachment) if attachment else None,
             ),
             "reply": (got.get("reply_to_id") or 0, reply_id),
             "date": (_stamp(got.get("original_date")), original),
@@ -375,7 +398,7 @@ def _view(expected, capture, authors, zone, media_hashes, media):
                 found.append(key)
         if all(marks[key] == "same" for key in ("imported", "text")):
             seen.add(i)
-            if marks["date"] == marks["label"] == marks["attachment"] == "same" and all(
+            if marks["date"] == marks["label"] == marks["attachment"] == marks["attachment_binding"] == "same" and all(
                 marks[k] != "different"
                 for k in ("document_name", "document_mime", "media_type", "media_kind", "media_bytes")
             ):
@@ -391,6 +414,9 @@ def _view(expected, capture, authors, zone, media_hashes, media):
                 "source_id": want["source_id"],
                 "ordinal": i,
                 "fields": marks,
+                "binding_error": UNRESOLVED if binding_error else None,
+                "literal_attachment_marker": marker,
+                "forward_header_kind": got.get("forward_header_kind"),
                 "media_kind": got.get("media_kind"),
                 "document_name": got.get("document_name"),
                 "mapped_telegram_peer_id": identity,
@@ -409,7 +435,7 @@ def _view(expected, capture, authors, zone, media_hashes, media):
                 "media_probe_scope": got.get("media_probe_scope", "none"),
                 "media_bytes": marks["media_bytes"],
                 "verification_status": "differences"
-                if any(marks[key] == "different" for key in (*SERVER_FIELDS, *VISUAL_FIELDS, "media_kind"))
+                if any(marks[key] == "different" for key in (*SERVER_FIELDS, *VISUAL_FIELDS, "media_kind", "attachment_binding"))
                 else "unknown"
                 if any(marks[key] == "unknown" for key in (*SERVER_FIELDS, *VISUAL_FIELDS))
                 else "verified",
@@ -461,6 +487,9 @@ def compare(bundle, first, second=None, mapping=None, *, project=None, progress=
     media = {item["name"]: item for item in bundle.data["media"]}
     inspected = [_view(expected, capture, authors, zone, media_hashes, media) for capture in snapshots]
     views = [result[0] for result in inspected]
+    unresolved = {
+        match["ordinal"] for view in views for match in view["matched"] if match["binding_error"]
+    }
     paired = len(views) == 2
     complete_read = paired and all(v["evidence_candidates"] and not v["scope"]["truncated"] for v in views)
     visibility = (
@@ -472,7 +501,7 @@ def compare(bundle, first, second=None, mapping=None, *, project=None, progress=
             for v in views
         )
     )
-    accepted = visibility and all(
+    accepted = visibility and not unresolved and all(
         (
             v["scope"]["kind"] == "legacy"
             or v["scope"]["kind"] == "id_window"
@@ -482,6 +511,8 @@ def compare(bundle, first, second=None, mapping=None, *, project=None, progress=
         for v in views
     )
     server = _level(views, SERVER_FIELDS, count, confirmed=visibility) if complete_read else "unknown"
+    if unresolved:
+        server = "differences"
     if complete_read and any(
         v["metrics"][k].get("different")
         for v in views
@@ -509,7 +540,7 @@ def compare(bundle, first, second=None, mapping=None, *, project=None, progress=
     statuses = (local["status"], server, visual)
     state = (
         "differences"
-        if complete_read and "differences" in statuses
+        if unresolved or (complete_read and "differences" in statuses)
         else "verified"
         if all(s == "verified" for s in statuses)
         else "inconclusive"
@@ -528,6 +559,8 @@ def compare(bundle, first, second=None, mapping=None, *, project=None, progress=
         if paired and (server_observed or client_verified)
         else "INCONCLUSIVE",
     }[state]
+    if unresolved:
+        verification_status = "PARTIALLY_CONFIRMED"
     quality = {
         label: _level(
             views,
@@ -585,6 +618,7 @@ def compare(bundle, first, second=None, mapping=None, *, project=None, progress=
         "evidence_status": evidence_status,
         "server_messages_observed": server_observed,
         "client_messages_verified": client_verified,
+        "unresolved_attachments": len(unresolved),
         "verified_records": client_verified,
         "visual_status": "VISUAL_RECONSTRUCTION_CONFIRMED"
         if visual == "verified"

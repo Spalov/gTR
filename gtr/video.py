@@ -4,13 +4,16 @@ import json
 import math
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, replace
+from importlib.util import find_spec
 from pathlib import Path
 from threading import BoundedSemaphore, Thread
 from time import monotonic
 from uuid import uuid4
 
 from .files import digest, local
+from .gge_process import CREATE_SUSPENDED, resume_worker, tool_environment
 from .media_engine import MalformedMedia, _box_headers, inspect
 from .media_queue import MIN_FREE, MediaDiskSpace
 from .model import Cancelled, RecoveryError, quiet
@@ -19,6 +22,9 @@ from .structure import unicode_text
 VIDEO_POLICIES = {
     "original": "Оригинал",
     "compatible": "Совместимость (разрешить создание копий)",
+    "remux": "Смена контейнера без перекодирования",
+    "fidelity": "Максимальная точность",
+    "compact": "Уменьшенная копия",
     "document": "Передать видео документом",
     "skip": "Пропустить несовместимые видео",
 }
@@ -35,6 +41,7 @@ DEMUXERS = {
     "audio/mpeg": "mp3",
     "audio/aac": "aac",
     "audio/wav": "wav",
+    "audio/flac": "flac",
     "image/gif": "gif",
 }
 PROCESSES = BoundedSemaphore(2)
@@ -61,6 +68,9 @@ class VideoEvidence:
     sample_aspect_ratio: float | None = None
     stream_index: int | None = None
     method: str | None = None
+    alpha: bool = False
+    color_space: str | None = None
+    streams: int | None = None
 
     def attributes(self, kind):
         if not self.playable:
@@ -95,9 +105,7 @@ def _input(path, mime):
     return [*args, "-i", str(path)]
 
 
-def _limit(process):
-    import sys
-
+def _limit(process, *, python_worker=False):
     if sys.platform != "win32":
         return None
     import win32api
@@ -111,7 +119,7 @@ def _limit(process):
             | win32job.JOB_OBJECT_LIMIT_PROCESS_MEMORY
             | win32job.JOB_OBJECT_LIMIT_ACTIVE_PROCESS
         )
-        limits["BasicLimitInformation"]["ActiveProcessLimit"] = 1
+        limits["BasicLimitInformation"]["ActiveProcessLimit"] = 2 if python_worker else 1
         limits["ProcessMemoryLimit"] = 1024**3
         win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, limits)
         handle = win32api.OpenProcess(0x0101, False, process.pid)
@@ -125,15 +133,15 @@ def _limit(process):
         raise
 
 
-def _run(executable, args, seconds, progress, *, duration_ms=None):
+def _run(executable, args, seconds, progress, *, duration_ms=None, python_worker=False, cwd=None):
     while not PROCESSES.acquire(timeout=0.25):
         progress("probe_media", 0, 0)
     job = None
     try:
         with subprocess.Popen(
-            [str(executable), *args], cwd=executable.parent, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            [str(executable), *args], cwd=cwd or executable.parent, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=tool_environment(executable, python_worker=python_worker),
+            creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0) | CREATE_SUSPENDED) if sys.platform == "win32" else 0,
         ) as process:
             output = []
             media_ms = 0
@@ -154,10 +162,11 @@ def _run(executable, args, seconds, progress, *, duration_ms=None):
             reader = Thread(target=read, daemon=True)
             try:
                 try:
-                    job = _limit(process)
+                    job = _limit(process, python_worker=python_worker)
+                    if job:
+                        resume_worker(process.pid)
                 except Exception:  # noqa: BLE001 - fail closed if the OS refuses process limits
-                    if process.poll() is None:
-                        return None
+                    return None
                 reader.start()
                 deadline = monotonic() + seconds
                 while monotonic() < deadline:
@@ -243,9 +252,11 @@ def interpret_probe(data, mime, streaming=None, decode="unknown", kind="video"):
         width = height = None
     width, height = (int(i) if i else None for i in (width, height))
     codec, pixel = video.get("codec_name"), video.get("pix_fmt")
+    alpha = ((pixel or "").startswith(("yuva", "rgba", "bgra", "argb", "abgr", "gbrap"))
+             or (video.get("tags") or {}).get("alpha_mode") == "1")
     compatible = (
         mime == "video/mp4" and codec == "h264" and pixel in {"yuv420p", "yuvj420p"}
-        and set(audio) <= {"aac"} and (kind != "round_video" or width == height)
+        and not alpha and set(audio) <= {"aac"} and (kind != "round_video" or width == height)
     )
     status = (
         "decode_failed" if decode == "failed" else "missing_metadata" if not (duration and width and height)
@@ -256,6 +267,7 @@ def interpret_probe(data, mime, streaming=None, decode="unknown", kind="video"):
         _rotation(video), streaming, pixel, decode, status == "compatible",
         _fps(str(video.get("sample_aspect_ratio", "")).replace(":", "/")),
         video["index"] if type(video.get("index")) is int and 0 <= video["index"] < 128 else None,
+        alpha=alpha, color_space=video.get("color_space"), streams=len(streams),
     )
 
 
@@ -275,16 +287,19 @@ def _aspect(evidence):
 
 def _remux_possible(evidence):
     return (
-        evidence.container == "video/quicktime" and evidence.codec == "h264"
+        evidence.container in {"video/quicktime", "video/mp4", "video/x-matroska"} and evidence.codec == "h264"
+        and not evidence.alpha
         and evidence.pixel_format in {"yuv420p", "yuvj420p"} and set(evidence.audio or ()) <= {"aac"}
     )
 
 
-def compatible_copy_matches(actual, evidence):
+def compatible_copy_matches(actual, evidence, *, profile="compatible"):
     return (
         actual.playable and actual.streaming and actual.decode == "sample_ok" and actual.duration
         and abs(actual.duration - evidence.duration) <= max(0.2, 2 / (evidence.fps or 25))
         and len(actual.audio or ()) == len(evidence.audio or ())
+        and (not actual.fps or not evidence.fps or abs(actual.fps / evidence.fps - 1) <= 0.03)
+        and (profile != "fidelity" or min(actual.width, actual.height) >= min(evidence.width, evidence.height))
         and abs(_aspect(actual) / _aspect(evidence) - 1) <= 0.03
     )
 
@@ -300,8 +315,9 @@ class MediaTools:
             return None
         out = _run(self.ffprobe, [
             "-v", "error", *_input(path, mime), "-show_entries",
-            ("format=duration:format_tags=title,artist:stream=index,codec_type,codec_name,pix_fmt,width,height,duration,avg_frame_rate,sample_aspect_ratio:"
-             "stream_disposition=attached_pic:stream_side_data=rotation:stream_tags=rotate,title,artist"),
+            ("format=duration:format_tags=title,artist:stream=index,codec_type,codec_name,pix_fmt,width,height,duration,"
+             "avg_frame_rate,sample_aspect_ratio,color_space:stream_disposition=attached_pic:"
+             "stream_side_data=rotation:stream_tags=rotate,title,artist,alpha_mode"),
             "-of", "json",
         ], 15, progress)
         try:
@@ -352,7 +368,7 @@ class MediaTools:
             or _number((data.get("format") or {}).get("duration"), MAX_DURATION)
             or facts.duration
         )
-        codec = stream.get("codec_name")
+        codec = stream.get("codec_name") or facts.audio_codec
         voice = item["kind"] == "voice"
         suitable = facts.mime and facts.mime.startswith("audio/") and (
             not voice or (facts.mime in {"audio/ogg", "audio/opus"} and codec == "opus")
@@ -368,9 +384,10 @@ class MediaTools:
                 attributes[field] = text
         return {"status": "audio_confirmed", "codec": codec, "attributes": attributes}
 
-    def compatibility_copy(self, source, dest, kind, evidence, expected_hash, progress=quiet, *, force_transcode=False):
+    def compatibility_copy(self, source, dest, kind, evidence, expected_hash, progress=quiet, *,
+                           force_transcode=False, profile="compatible"):
         if not (self.ffmpeg and self.ffprobe and evidence.container in DEMUXERS and evidence.duration
-                and evidence.codec and evidence.decode != "failed"):
+                and evidence.codec and evidence.decode != "failed" and not evidence.alpha):
             raise RecoveryError("Совместимая копия недоступна. Проверьте FFmpeg и состояние исходного видео.")
         src, dest = local(Path(source)), local(Path(dest))
         if dest.exists() or src == dest:
@@ -384,6 +401,8 @@ class MediaTools:
         # FFmpeg applies display rotation while decoding. Scale by at most one pixel
         # for 4:2:0 and let the scale filter adjust the sample aspect ratio.
         vf = "scale=ceil(iw/2)*2:ceil(ih/2)*2"
+        if profile == "compact":
+            vf = "scale=w='min(iw,1280)':h='min(ih,1280)':force_original_aspect_ratio=decrease:force_divisible_by=2"
         base = [
             "-nostdin", "-v", "error", "-xerror", "-n", "-threads", "1", *_input(src, evidence.container),
             "-map", _stream_selector(evidence.stream_index), "-map", "0:a?", "-map_metadata", "-1", "-map_chapters", "-1",
@@ -395,9 +414,10 @@ class MediaTools:
             "-fs", str(min(MAX_COPY, available)), "-f", "mp4", str(dest),
         ]
         encode_options = ["-filter_threads", "1", "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
-                          "-preset", "fast", "-crf", "18", "-threads", "1", "-c:a", "aac"]
-        attempts = [("transcode", encode_options)]
-        if not force_transcode and _remux_possible(evidence):
+                          "-preset", "fast", "-crf", "23" if profile == "compact" else "18", "-threads", "1",
+                          "-fps_mode", "passthrough", "-c:a", "aac"]
+        attempts = [] if profile == "remux" else [("transcode", encode_options)]
+        if not force_transcode and profile != "compact" and _remux_possible(evidence):
             attempts.insert(0, ("remux", ["-c", "copy"]))
         duration_ms = max(1, round(evidence.duration * 1000))
         for method, options in attempts:
@@ -409,8 +429,14 @@ class MediaTools:
             if dest.is_file() and result is not None:
                 actual = self.analyze(dest, kind, progress=progress)
                 same_rotation = (actual.rotation or 0) == (evidence.rotation or 0)
-                if compatible_copy_matches(actual, evidence) and (method != "remux" or same_rotation):
-                    return replace(actual, method=method)
+                if compatible_copy_matches(actual, evidence, profile=profile) and (method != "remux" or same_rotation):
+                    decoded = _run(self.ffmpeg, [
+                        "-nostdin", "-v", "error", "-xerror", "-threads", "1", *_input(dest, "video/mp4"),
+                        "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn", "-progress", "pipe:1", "-nostats",
+                        "-f", "null", "-",
+                    ], min(7200, max(90, evidence.duration * 5)), progress, duration_ms=duration_ms)
+                    if decoded is not None:
+                        return replace(actual, method=method)
             dest.unlink(missing_ok=True)
             if shutil.disk_usage(dest.parent).free <= MIN_FREE:
                 raise MediaDiskSpace()
@@ -468,9 +494,11 @@ def video_options(original, item, tools):
     actions = []
     if original.playable:
         actions.append("original")
-    if (original.status in {"compatible", "transcode_required"} and tools.ffmpeg and tools.ffprobe
+    if (original.status in {"compatible", "transcode_required"} and tools.ffmpeg and tools.ffprobe and not original.alpha
             and (item["kind"] != "round_video" or original.width == original.height)):
-        actions.append("compatible")
+        actions.extend(("compatible", "fidelity", "compact"))
+        if _remux_possible(original):
+            actions.append("remux")
     if original.status not in {"missing", "empty", "size_mismatch", "hash_mismatch", "changed", "unreadable"}:
         actions.append("document")
     actions.append("skip")
@@ -483,10 +511,11 @@ def queue_video(item, path, policy, tools, progress, work, queue, entry, explici
     options = video_options(original, item, tools)
     force_transcode = explicit == "reencode"
     desired = ("compatible" if force_transcode else explicit) or (
-        "original" if original.playable and policy != "document" else policy
+        "original" if original.playable and policy not in {"document", "compact"} else policy
     )
-    action = {"original": "keep", "compatible": "convert"}.get(desired, desired) if desired in options else "blocked"
-    problem = original.status
+    copies = {"compatible", "remux", "fidelity", "compact"}
+    action = ("keep" if desired == "original" else "convert" if desired in copies else desired) if desired in options else "blocked"
+    problem = "alpha_requires_original" if original.alpha and action == "blocked" else original.status
     if action == "blocked" and original.status == "transcode_required" and not tools.ffmpeg:
         problem = "ffmpeg_unavailable"
     record = {"key": entry["key"], "action": action, "original": original.summary(), "original_sha256": item["sha256"]}
@@ -496,7 +525,8 @@ def queue_video(item, path, policy, tools, progress, work, queue, entry, explici
         work.mkdir(exist_ok=True)
         target = work / Path(item["name"]).with_suffix(".mp4").name
         try:
-            record.update(queue.copy(tools, path, target, item, original, progress, force_transcode=force_transcode))
+            record.update(queue.copy(tools, path, target, item, original, progress, force_transcode=force_transcode,
+                                     profile=desired))
         except MediaDiskSpace:
             target.unlink(missing_ok=True)
             problem = "disk_space"
@@ -537,3 +567,25 @@ def observed_media_kind(media):
     if audio := attributes.get("DocumentAttributeAudio"):
         return "voice" if getattr(audio, "voice", False) else "audio"
     return "document"
+
+
+def gge_probe(path, kind, progress=quiet):
+    """Call the optional GGE/PyAV helper under the same limits as local tools."""
+    if find_spec("av" if kind != "image" else "PIL") is None:
+        return None
+    executable = local(Path(sys.executable))
+    return _run(executable, ["-X", "utf8", "-m", "gtr.gge_video", kind, str(path)], 16, progress,
+                python_worker=True, cwd=Path(__file__).resolve().parent.parent)
+
+
+def detailed_probe(path, mime, progress=quiet):
+    raw = gge_probe(path, "probe", progress)
+    if raw:
+        return {"engine": "gge", **json.loads(raw)}
+    data = MediaTools().probe(path, mime, progress)
+    if data is None:
+        return {}
+    if mime.startswith("video/"):
+        return {"engine": "ffprobe", **interpret_probe(data, mime).summary()}
+    return {"engine": "ffprobe", "streams": len(data["streams"]),
+            "audio": [s.get("codec_name") for s in data["streams"] if s.get("codec_type") == "audio"]}

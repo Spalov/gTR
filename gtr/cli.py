@@ -1,6 +1,8 @@
 import argparse
 import json
+import os
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -41,6 +43,10 @@ def arguments():
     commands = parser.add_subparsers(dest="command")
     gui = commands.add_parser("gui", help="Открыть приложение")
     gui.add_argument("--project", type=Path)
+    classic = commands.add_parser("classic", help="Открыть прежний интерфейс")
+    classic.add_argument("--project", type=Path)
+    classic.add_argument("--bundle", type=Path)
+    classic.add_argument("--section", choices=("telegram", "import", "history", "settings"))
     scan = commands.add_parser("analyze", help="Создать локальный проект")
     scan.add_argument("source", type=Path)
     scan.add_argument("--project", type=Path, required=True)
@@ -180,9 +186,26 @@ def main(argv=None):
     args = arguments().parse_args(argv)
     try:
         if args.command in (None, "gui"):
+            from . import updates
+
+            if updates.portable():
+                root = Path(sys.executable).parent.parent
+                shell = root / "runtime/Lib/site-packages/PySide6/gTR-shell.exe"
+                if shell.is_file():
+                    options = ["--project", str(local(args.project))] if getattr(args, "project", None) else []
+                    try:
+                        return subprocess.run([str(shell), *options], cwd=root, check=False).returncode
+                    except OSError:
+                        pass
             from .gui import launch
 
             return launch(getattr(args, "project", None))
+        if args.command == "classic":
+            from . import updates
+            from .gui import launch
+
+            os.environ.pop(updates.BOOT_ENV, None)
+            return launch(args.project, bundle=args.bundle, section=args.section, classic=True)
         if args.command == "analyze":
             result = summary(analyze(args.source, args.project, args.timezone, export_format=args.format))
         elif args.command == "report":

@@ -1,0 +1,24 @@
+#include <winver.h>
+1 ICON "@GTR_ICON@"
+1 VERSIONINFO
+ FILEVERSION @GTR_BETA_NUMBER@,0,@GTR_FIX_NUMBER@,0
+ PRODUCTVERSION @GTR_BETA_NUMBER@,0,@GTR_FIX_NUMBER@,0
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "Gruzin\0"
+            VALUE "FileDescription", "gTR Beta @GTR_BETA_NUMBER@@GTR_FIX_LABEL@\0"
+            VALUE "FileVersion", "@GTR_BETA_NUMBER@.0.@GTR_FIX_NUMBER@.0\0"
+            VALUE "ProductName", "Gruzin's Telegram Recovery\0"
+            VALUE "ProductVersion", "Beta @GTR_BETA_NUMBER@@GTR_FIX_LABEL@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+ END

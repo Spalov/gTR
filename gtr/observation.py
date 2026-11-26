@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 
+from .bindings import digest_text, literal_marker, wire_name
 from .faults import ImportFault
 from .files import local, publish_text, read_json
 from .model import RecoveryError, quiet
@@ -109,6 +110,9 @@ class ObservedMessage:
     document_name: str | None = None
     document_mime: str | None = None
     media_kind: str | None = None
+    attachment_marker_sha256: str | None = None
+    caption_without_marker_sha256: str | None = None
+    forward_header_kind: str = "absent"
 
 
 async def last_id(manager, target, *, bundle=None, path=None, protected=()):
@@ -211,6 +215,7 @@ async def capture(manager, target, bundle, window: CaptureWindow, progress=quiet
     through = window.through_id
     cap = window.max_scan or min(bundle.data["included"] + 200, MAX_SCAN)
     signatures = {row["text_sha256"] for row in bundle.data["records"] if row["included"]} if dates else set()
+    aliases = {digest_text(wire_name(item)) for item in bundle.data["media"]} if dates else set()
 
     async def collect():
         observations = []
@@ -231,12 +236,14 @@ async def capture(manager, target, bundle, window: CaptureWindow, progress=quiet
             media = getattr(msg, "media", None)
             original_date = getattr(header, "date", None)
             imported = bool(getattr(header, "imported", False))
-            text_hash = hashlib.sha256((getattr(msg, "message", None) or "").encode()).hexdigest()
+            message = getattr(msg, "message", None) or ""
+            text_hash = digest_text(message)
+            marker, caption = literal_marker(message) if imported else (None, None)
             if dates and (
                 not imported
                 or not original_date
                 or not dates[0] <= original_date.astimezone(UTC).date() <= dates[1]
-                or text_hash not in signatures
+                or (text_hash not in signatures and marker not in aliases)
             ):
                 continue
             has_media = bool(
@@ -290,6 +297,9 @@ async def capture(manager, target, bundle, window: CaptureWindow, progress=quiet
                 document_name=filename,
                 document_mime=getattr(document, "mime_type", None),
                 media_kind=observed_media_kind(media),
+                attachment_marker_sha256=marker,
+                caption_without_marker_sha256=caption,
+                forward_header_kind="imported" if imported else "native_forward" if header else "absent",
             )
             observations.append(asdict(item))
         observations.reverse()

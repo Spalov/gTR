@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import json
 import mimetypes
 import os
 import re
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from .archive import MAX_FILE_BYTES
 from .files import BLOCK, local, safe_parts
+from .gge_metadata import jpeg_capture_date
 from .media import identify
 from .model import Cancelled, RecoveryError, quiet
 
@@ -56,6 +58,10 @@ class MediaFacts:
     sample_rate: int | None = None
     channels: int | None = None
     orientation: int | None = None
+    audio_codec: str | None = None
+    alpha: bool | None = None
+    animated: bool | None = None
+    capture_date: dict | None = None
     issues: tuple[str, ...] = ()
 
     @property
@@ -119,6 +125,7 @@ def _jpeg_size(head):
 
 
 def _image(stream, head, size, mime):
+    details = {}
     if mime == "image/png":
         if (
             len(head) < 33
@@ -128,6 +135,8 @@ def _image(stream, head, size, mime):
         ):
             raise MalformedMedia
         dims = struct.unpack_from(">II", head, 16)
+        details["alpha"] = head[25] in (4, 6) or b"tRNS" in head
+        details["animated"] = b"acTL" in head
     elif mime == "image/jpeg":
         dims = _jpeg_size(head)
         if b"\xff\xd9" not in _tail(stream, size, 64 * 1024) or (dims is None and size <= len(head)):
@@ -143,14 +152,16 @@ def _image(stream, head, size, mime):
         dims = None
         if magic == b"VP8X" and len(head) >= 30:
             dims = tuple(int.from_bytes(head[i : i + 3], "little") + 1 for i in (24, 27))
+            details.update(alpha=bool(head[20] & 0x10), animated=bool(head[20] & 0x02))
         elif magic == b"VP8L" and len(head) >= 25 and head[20] == 0x2F:
             shape = int.from_bytes(head[21:25], "little")
             dims = (1 + (shape & 0x3FFF), 1 + ((shape >> 14) & 0x3FFF))
+            details.update(alpha=bool(shape & (1 << 28)), animated=False)
         elif magic == b"VP8 " and len(head) >= 30 and head[23:26] == b"\x9d\x01\x2a":
             dims = tuple(value & 0x3FFF for value in struct.unpack_from("<HH", head, 26))
     if dims is not None and not all(dims):
         raise MalformedMedia
-    return dict(zip(("width", "height"), dims)) if dims else {"issues": ("metadata_unavailable",)}
+    return {**details, "width": dims[0], "height": dims[1]} if dims else {"issues": ("metadata_unavailable",)}
 
 
 def _box_headers(stream, start, end, budget):
@@ -222,14 +233,16 @@ def _audio(stream, head, size, mime):
     vorbis = head.find(b"\x01vorbis", 27, 512)
     if opus != -1 and len(head) >= opus + 19:
         rate, channels, skip = 48000, head[opus + 9], int.from_bytes(head[opus + 10 : opus + 12], "little")
+        codec = "opus"
     elif vorbis != -1 and len(head) >= vorbis + 30:
         rate = int.from_bytes(head[vorbis + 12 : vorbis + 16], "little")
         channels, skip = head[vorbis + 11], 0
+        codec = "vorbis"
     else:
         return {"issues": ("metadata_unavailable",)}
     if not rate or not channels:
         raise MalformedMedia
-    result = {"sample_rate": rate, "channels": channels}
+    result = {"sample_rate": rate, "channels": channels, "audio_codec": codec}
     tail = _tail(stream, size, 128 * 1024)
     end = tail.rfind(b"OggS")
     if end >= 0 and len(tail) >= end + 27 and tail[end + 14 : end + 18] == head[14:18]:
@@ -237,6 +250,24 @@ def _audio(stream, head, size, mime):
         if ticks >= skip:
             result["duration"] = round((ticks - skip) / rate, 3)
     return result
+
+
+def _tgs(head, size):
+    if size > len(head):
+        raise MalformedMedia
+    stream = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    raw = stream.decompress(head, 1024**2 + 1)
+    if not stream.eof or stream.unused_data or len(raw) > 1024**2:
+        raise MalformedMedia
+    lottie = json.loads(raw)
+    if not isinstance(lottie, dict) or not isinstance(lottie.get("layers"), list):
+        raise MalformedMedia
+    w, h, fps, start, end = (lottie.get(key) for key in ("w", "h", "fr", "ip", "op"))
+    if not all(type(n) in (int, float) for n in (w, h, fps, start, end)):
+        raise MalformedMedia
+    if not (0 < w <= 512 and 0 < h <= 512 and 0 < fps <= 120 and 0 <= start < end <= start + 60 * fps):
+        raise MalformedMedia
+    return {"width": int(w), "height": int(h), "duration": (end - start) / fps, "animated": True}
 
 
 def _metadata(stream, head, size, mime):
@@ -247,7 +278,9 @@ def _metadata(stream, head, size, mime):
             return _mp4(stream, size)
         if mime in {"audio/wav", "audio/ogg"}:
             return _audio(stream, head, size, mime)
-    except (EOFError, MalformedMedia, struct.error, wave.Error):
+        if mime == "application/x-tgsticker":
+            return _tgs(head, size)
+    except (EOFError, ValueError, RecursionError, struct.error, wave.Error, zlib.error):
         return {"issues": ("corrupt_container",)}
     return {}
 
@@ -280,6 +313,7 @@ def inspect(
             metadata = _metadata(stream, head, size, mime) if recognized else {}
             if mime == "image/jpeg":
                 metadata["orientation"] = _orientation(head)
+                metadata["capture_date"] = jpeg_capture_date(head)
             issues = list(metadata.pop("issues", ()))
             if expected_size is not None and size != expected_size:
                 issues.append("size_mismatch")
@@ -470,7 +504,7 @@ def public_inventory(report):
             {
                 key: value
                 for key, value in item.items()
-                if key not in {"archive_paths", "sha256", "source_id", "source_ordinal", "name"}
+                if key not in {"archive_paths", "capture_date", "sha256", "source_id", "source_ordinal", "name"}
             }
             for item in report["items"]
         ],

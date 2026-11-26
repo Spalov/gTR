@@ -25,6 +25,7 @@ from .files import (
     publish_text,
     safe_parts,
 )
+from .gge_io import preflight_zip
 from .model import RecoveryError, quiet
 from .owner import app_home
 
@@ -176,34 +177,40 @@ def _verify_copy(source, copy, size, expected, progress):
 
 
 def _extract(zip_path, work, prefix, progress):
-    with ZipFile(zip_path) as package:
-        entries = package.infolist()
-        if len(entries) > 20000 or sum(entry.file_size for entry in entries) > MAX_EXTRACTED:
-            raise RecoveryError("Объём комплекта превышает допустимый размер.")
-        seen = set()
-        for index, entry in enumerate(entries, 1):
-            parts = safe_parts(entry.filename.rstrip("/"))
-            key = name_key("/".join(parts))
-            if (
-                len(parts) < 2
-                or parts[0] != prefix
-                or key in seen
-                or name_key(parts[-1]) == RECEIPT
-                or stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG, stat.S_IFDIR)
-            ):
-                raise RecoveryError("Архив обновления содержит недопустимый путь.")
-            seen.add(key)
-            out = work.joinpath(*parts[1:])
-            if entry.is_dir():
-                out.mkdir(parents=True, exist_ok=True)
-            else:
-                out.parent.mkdir(parents=True, exist_ok=True)
-                with package.open(entry) as source, out.open("xb") as target:
-                    for chunk in iter(lambda: source.read(BLOCK), b""):
-                        target.write(chunk)
-                        progress("extract_update", index, len(entries))
-        if any(not (work / name).is_file() for name in REQUIRED):
-            raise RecoveryError("В архиве отсутствуют файлы запуска gTR.")
+    with zip_path.open("rb") as source:
+        preflight_zip(source, max_entries=20_000)
+        with ZipFile(source) as package:
+            _extract_entries(package, work, prefix, progress)
+
+
+def _extract_entries(package, work, prefix, progress):
+    entries = package.infolist()
+    if len(entries) > 20000 or sum(entry.file_size for entry in entries) > MAX_EXTRACTED:
+        raise RecoveryError("Объём комплекта превышает допустимый размер.")
+    seen = set()
+    for index, entry in enumerate(entries, 1):
+        parts = safe_parts(entry.filename.rstrip("/"))
+        key = name_key("/".join(parts))
+        if (
+            len(parts) < 2
+            or parts[0] != prefix
+            or key in seen
+            or name_key(parts[-1]) == RECEIPT
+            or stat.S_IFMT(entry.external_attr >> 16) not in (0, stat.S_IFREG, stat.S_IFDIR)
+        ):
+            raise RecoveryError("Архив обновления содержит недопустимый путь.")
+        seen.add(key)
+        out = work.joinpath(*parts[1:])
+        if entry.is_dir():
+            out.mkdir(parents=True, exist_ok=True)
+        else:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            with package.open(entry) as source, out.open("xb") as target:
+                for chunk in iter(lambda: source.read(BLOCK), b""):
+                    target.write(chunk)
+                    progress("extract_update", index, len(entries))
+    if any(not (work / name).is_file() for name in REQUIRED):
+        raise RecoveryError("В архиве отсутствуют файлы запуска gTR.")
 
 
 def _versions():
