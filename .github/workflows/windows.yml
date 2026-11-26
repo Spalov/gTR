@@ -2,7 +2,8 @@ name: Offline Windows tests
 on: [push, pull_request]
 jobs:
   windows:
-    runs-on: windows-2025
+    # The release builder uses the Visual Studio 2022 generator.
+    runs-on: windows-2022
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
