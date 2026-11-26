@@ -4,7 +4,7 @@ import json
 import math
 import shutil
 import subprocess
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from threading import BoundedSemaphore, Thread
 from time import monotonic
@@ -12,7 +12,8 @@ from uuid import uuid4
 
 from .files import digest, local
 from .media_engine import MalformedMedia, _box_headers, inspect
-from .model import RecoveryError, quiet
+from .media_queue import MIN_FREE, MediaDiskSpace
+from .model import Cancelled, RecoveryError, quiet
 from .structure import unicode_text
 
 VIDEO_POLICIES = {
@@ -57,6 +58,9 @@ class VideoEvidence:
     pixel_format: str | None = None
     decode: str = "unknown"
     playable: bool = False
+    sample_aspect_ratio: float | None = None
+    stream_index: int | None = None
+    method: str | None = None
 
     def attributes(self, kind):
         if not self.playable:
@@ -121,7 +125,7 @@ def _limit(process):
         raise
 
 
-def _run(executable, args, seconds, progress):
+def _run(executable, args, seconds, progress, *, duration_ms=None):
     while not PROCESSES.acquire(timeout=0.25):
         progress("probe_media", 0, 0)
     job = None
@@ -132,10 +136,18 @@ def _run(executable, args, seconds, progress):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ) as process:
             output = []
+            media_ms = 0
 
             def read():
+                nonlocal media_ms
                 try:
-                    output.append(process.stdout.read(MAX_PROBE + 1))
+                    if duration_ms is None:
+                        output.append(process.stdout.read(MAX_PROBE + 1))
+                    else:
+                        while line := process.stdout.readline(256):
+                            if line.startswith(b"out_time_us=") and line[12:].strip().isdigit():
+                                media_ms = min(duration_ms, int(line[12:].strip()) // 1000)
+                        output.append(b"")
                 except OSError:
                     pass
 
@@ -149,7 +161,10 @@ def _run(executable, args, seconds, progress):
                 reader.start()
                 deadline = monotonic() + seconds
                 while monotonic() < deadline:
-                    progress("probe_media", 0, 0)
+                    if duration_ms is None:
+                        progress("probe_media", 0, 0)
+                    else:
+                        progress("convert_video", media_ms, duration_ms)
                     reader.join(0.15)
                     if not reader.is_alive():
                         if not output or len(output[0]) > MAX_PROBE:
@@ -239,6 +254,38 @@ def interpret_probe(data, mime, streaming=None, decode="unknown", kind="video"):
     return VideoEvidence(
         status, mime, codec, audio, duration, width, height, _fps(video.get("avg_frame_rate")),
         _rotation(video), streaming, pixel, decode, status == "compatible",
+        _fps(str(video.get("sample_aspect_ratio", "")).replace(":", "/")),
+        video["index"] if type(video.get("index")) is int and 0 <= video["index"] < 128 else None,
+    )
+
+
+def _video_stream(data):
+    return next((stream for stream in data.get("streams", []) if stream.get("codec_type") == "video"
+                 and not (stream.get("disposition") or {}).get("attached_pic")), {})
+
+
+def _stream_selector(index):
+    return f"0:{index}" if type(index) is int and 0 <= index < 128 else "0:V:0"
+
+
+def _aspect(evidence):
+    ratio = evidence.width * (evidence.sample_aspect_ratio or 1) / evidence.height
+    return 1 / ratio if (evidence.rotation or 0) % 180 == 90 else ratio
+
+
+def _remux_possible(evidence):
+    return (
+        evidence.container == "video/quicktime" and evidence.codec == "h264"
+        and evidence.pixel_format in {"yuv420p", "yuvj420p"} and set(evidence.audio or ()) <= {"aac"}
+    )
+
+
+def compatible_copy_matches(actual, evidence):
+    return (
+        actual.playable and actual.streaming and actual.decode == "sample_ok" and actual.duration
+        and abs(actual.duration - evidence.duration) <= max(0.2, 2 / (evidence.fps or 25))
+        and len(actual.audio or ()) == len(evidence.audio or ())
+        and abs(_aspect(actual) / _aspect(evidence) - 1) <= 0.03
     )
 
 
@@ -253,7 +300,7 @@ class MediaTools:
             return None
         out = _run(self.ffprobe, [
             "-v", "error", *_input(path, mime), "-show_entries",
-            ("format=duration:format_tags=title,artist:stream=codec_type,codec_name,pix_fmt,width,height,duration,avg_frame_rate:"
+            ("format=duration:format_tags=title,artist:stream=index,codec_type,codec_name,pix_fmt,width,height,duration,avg_frame_rate,sample_aspect_ratio:"
              "stream_disposition=attached_pic:stream_side_data=rotation:stream_tags=rotate,title,artist"),
             "-of", "json",
         ], 15, progress)
@@ -281,7 +328,8 @@ class MediaTools:
         if self.ffmpeg:
             decoded = _run(self.ffmpeg, [
                 "-nostdin", "-v", "error", "-xerror", "-threads", "1", *_input(path, mime),
-                "-map", "0:v:0", "-frames:v", "30", "-an", "-sn", "-dn", "-f", "null", "-",
+                "-map", _stream_selector(_video_stream(data).get("index")), "-frames:v", "30",
+                "-an", "-sn", "-dn", "-f", "null", "-",
             ], 18, progress)
             decode = "sample_ok" if decoded is not None else "failed"
         if expected_hash and digest(path, lambda: progress("probe_media", 0, 0)) != expected_hash:
@@ -320,28 +368,53 @@ class MediaTools:
                 attributes[field] = text
         return {"status": "audio_confirmed", "codec": codec, "attributes": attributes}
 
-    def compatibility_copy(self, source, dest, kind, evidence, expected_hash, progress=quiet):
+    def compatibility_copy(self, source, dest, kind, evidence, expected_hash, progress=quiet, *, force_transcode=False):
         if not (self.ffmpeg and self.ffprobe and evidence.container in DEMUXERS and evidence.duration
                 and evidence.codec and evidence.decode != "failed"):
             raise RecoveryError("Совместимая копия недоступна. Проверьте FFmpeg и состояние исходного видео.")
         src, dest = local(Path(source)), local(Path(dest))
         if dest.exists() or src == dest:
             raise RecoveryError("Выберите новую папку для совместимой копии.")
-        vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
-        result = _run(self.ffmpeg, [
+        checkpoint = lambda: progress("verify_video_source", 0, 0)
+        if digest(src, checkpoint) != expected_hash:
+            raise RecoveryError("Оригинал видео изменился после анализа.")
+        available = shutil.disk_usage(dest.parent).free - MIN_FREE
+        if available <= 0:
+            raise MediaDiskSpace()
+        # FFmpeg applies display rotation while decoding. Scale by at most one pixel
+        # for 4:2:0 and let the scale filter adjust the sample aspect ratio.
+        vf = "scale=ceil(iw/2)*2:ceil(ih/2)*2"
+        base = [
             "-nostdin", "-v", "error", "-xerror", "-n", "-threads", "1", *_input(src, evidence.container),
-            "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1",
-            "-sn", "-dn", "-filter_threads", "1", "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-preset", "veryfast", "-threads", "1", "-c:a", "aac", "-movflags", "+faststart",
-            "-fs", str(MAX_COPY), "-f", "mp4", str(dest),
-        ], min(900, max(60, evidence.duration * 4)), progress)
-        if result is None or not dest.is_file() or digest(src) != expected_hash:
-            raise RecoveryError("Не удалось создать проверенную совместимую копию видео.")
-        actual = self.analyze(dest, kind, progress=progress)
-        if (not actual.playable or not actual.streaming or not actual.duration
-                or abs(actual.duration - evidence.duration) > max(0.2, 2 / (evidence.fps or 25))):
-            raise RecoveryError("Совместимая копия не прошла проверку типа, потоков или длительности.")
-        return actual
+            "-map", _stream_selector(evidence.stream_index), "-map", "0:a?", "-map_metadata", "-1", "-map_chapters", "-1",
+            "-sn", "-dn",
+        ]
+        output = [
+            "-movflags", "+faststart",
+            "-progress", "pipe:1", "-nostats", "-stats_period", "0.25",
+            "-fs", str(min(MAX_COPY, available)), "-f", "mp4", str(dest),
+        ]
+        encode_options = ["-filter_threads", "1", "-vf", vf, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                          "-preset", "fast", "-crf", "18", "-threads", "1", "-c:a", "aac"]
+        attempts = [("transcode", encode_options)]
+        if not force_transcode and _remux_possible(evidence):
+            attempts.insert(0, ("remux", ["-c", "copy"]))
+        duration_ms = max(1, round(evidence.duration * 1000))
+        for method, options in attempts:
+            progress("convert_video", 0, duration_ms)
+            result = _run(self.ffmpeg, [*base, *options, *output], min(7200, max(120, evidence.duration * 8)),
+                          progress, duration_ms=duration_ms)
+            if digest(src, checkpoint) != expected_hash:
+                raise RecoveryError("Оригинал видео изменился при подготовке.")
+            if dest.is_file() and result is not None:
+                actual = self.analyze(dest, kind, progress=progress)
+                same_rotation = (actual.rotation or 0) == (evidence.rotation or 0)
+                if compatible_copy_matches(actual, evidence) and (method != "remux" or same_rotation):
+                    return replace(actual, method=method)
+            dest.unlink(missing_ok=True)
+            if shutil.disk_usage(dest.parent).free <= MIN_FREE:
+                raise MediaDiskSpace()
+        raise RecoveryError("Совместимая копия не прошла проверку типа, потоков или длительности.")
 
 
 def video_representation(item, decision):
@@ -388,6 +461,60 @@ def prepare_video(item, path, policy, tools, progress, work=None):
             path, target, item["kind"], original, item["sha256"], progress
         )
         record.update(output=converted.summary(), size=target.stat().st_size, sha256=digest(target))
+    return video_representation(item, record), record
+
+
+def video_options(original, item, tools):
+    actions = []
+    if original.playable:
+        actions.append("original")
+    if (original.status in {"compatible", "transcode_required"} and tools.ffmpeg and tools.ffprobe
+            and (item["kind"] != "round_video" or original.width == original.height)):
+        actions.append("compatible")
+    if original.status not in {"missing", "empty", "size_mismatch", "hash_mismatch", "changed", "unreadable"}:
+        actions.append("document")
+    actions.append("skip")
+    return tuple(actions)
+
+
+def queue_video(item, path, policy, tools, progress, work, queue, entry, explicit=None):
+    queue.start(entry["name"])
+    original = queue.probe(tools, path, item, progress)
+    options = video_options(original, item, tools)
+    force_transcode = explicit == "reencode"
+    desired = ("compatible" if force_transcode else explicit) or (
+        "original" if original.playable and policy != "document" else policy
+    )
+    action = {"original": "keep", "compatible": "convert"}.get(desired, desired) if desired in options else "blocked"
+    problem = original.status
+    if action == "blocked" and original.status == "transcode_required" and not tools.ffmpeg:
+        problem = "ffmpeg_unavailable"
+    record = {"key": entry["key"], "action": action, "original": original.summary(), "original_sha256": item["sha256"]}
+    if action == "keep":
+        record["output"] = original.summary()
+    if action == "convert" and work is not None:
+        work.mkdir(exist_ok=True)
+        target = work / Path(item["name"]).with_suffix(".mp4").name
+        try:
+            record.update(queue.copy(tools, path, target, item, original, progress, force_transcode=force_transcode))
+        except MediaDiskSpace:
+            target.unlink(missing_ok=True)
+            problem = "disk_space"
+        except Cancelled:
+            raise
+        except (RecoveryError, OSError):
+            target.unlink(missing_ok=True)
+            problem = "conversion_failed"
+        if "output" not in record:
+            record["action"] = "blocked"
+    if record["action"] == "blocked":
+        group = ":".join(str(value or "-") for value in (problem, item["kind"], original.container, original.codec, *options))
+        entry.update(group=group, original=original.summary(), options=options, reason=problem,
+                     recommended="compatible" if "compatible" in options and problem != "conversion_failed"
+                     else "document" if "document" in options else "skip")
+        queue.finish(entry)
+    else:
+        queue.finish()
     return video_representation(item, record), record
 
 

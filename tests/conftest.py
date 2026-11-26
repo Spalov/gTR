@@ -35,6 +35,12 @@ sys.addaudithook(network_guard)
 @pytest.fixture(autouse=True)
 def isolated_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-profile"))
+    from PySide6.QtCore import QSettings
+
+    from gtr import gui
+
+    settings = QSettings(str(tmp_path / "gtr.ini"), QSettings.Format.IniFormat)
+    monkeypatch.setattr(gui, "QSettings", lambda *_: settings)
 
 
 def message(sid, text="", **fields):

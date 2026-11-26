@@ -119,25 +119,23 @@ def check_update(folder, work, archive):
     script = """
 import subprocess
 import sys
-from functools import partial
 from hashlib import file_digest
 from pathlib import Path
 from unittest.mock import patch
 
-from gtr import BETA_NUMBER, __version__, updates
+from gtr import BETA_FIX, BETA_NUMBER, __version__, updates
 
 file = Path(sys.argv[1])
 with file.open("rb") as stream:
     digest = file_digest(stream, "sha256").hexdigest()
-from_previous_beta = partial(updates.candidate, current=BETA_NUMBER - 1)
+previous_beta = (BETA_NUMBER if BETA_FIX else BETA_NUMBER - 1, False)
 project = updates.app_home() / "projects" / "synthetic.txt"
 project.parent.mkdir(parents=True)
 project.write_text("existing local data")
-with patch.object(updates, "candidate", from_previous_beta), patch.object(
-    updates, "official_asset", return_value=(file.stat().st_size, digest)
-):
-    installed = updates.install(from_previous_beta(file))
-assert updates.installed_update(current=BETA_NUMBER - 1) == installed
+with patch.object(updates, "official_asset", return_value=(file.stat().st_size, digest)):
+    installed = updates.install(updates.candidate(file, previous_beta), current=previous_beta)
+assert updates.installed_update(current=previous_beta) == installed
+assert updates.installed_update() is None
 assert project.read_text() == "existing local data"
 version = subprocess.check_output(
     [str(installed / "runtime/python.exe"), "-m", "gtr", "--version"], cwd=installed

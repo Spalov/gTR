@@ -33,12 +33,18 @@ from .history import (
     ordered_rows,
 )
 from .media import KIND_NAMES
+from .media_queue import (
+    MediaDecisionRequired,
+    MediaQueue,
+    validate_decisions,
+    video_decision_key,
+)
 from .model import RecoveryError, quiet
 from .payloads import STRUCTURED, plan_media, publish_media, validate_media_input
 from .profiles import MARKER, MEDIA_NAME, PROFILES, read_records, wire_line
 from .selection import decode_intervals, difference, included_intervals
 from .structure import annotated_text, historical_notes, local_structure
-from .video import VIDEO_KINDS, VIDEO_POLICIES, MediaTools, prepare_video
+from .video import VIDEO_KINDS, VIDEO_POLICIES, MediaTools, queue_video
 
 PROFILE = PROFILES["ios"]
 MEDIA_MODES = {
@@ -178,6 +184,35 @@ RECORD_KINDS = {
 }
 
 
+def _video_entry(item, meta, row, source_hash, chat_id, source_ordinal, *, grouped=False):
+    members = [member for member in item.get("members", ()) if member["kind"] in VIDEO_KINDS]
+    source = members[0] if grouped else item
+    digest_key = hashlib.sha256(encode([member["sha256"] for member in members]).encode()).hexdigest() if grouped else source["sha256"]
+    labels = meta.get("file_names", {})
+    if not isinstance(labels, dict):
+        labels = {}
+    name = safe_filename(labels.get(source["source"]) or meta.get("file_name") or source["source"])
+    return {
+        "key": video_decision_key(source_hash, chat_id, source_ordinal, digest_key, grouped),
+        "name": name, "date": row["date_iso"] or row["date_raw"], "source": source["source"],
+        "size": item["size"], "sha256": source["sha256"],
+    }
+
+
+def _group_video(entry, action, queue):
+    queue.start(entry["name"])
+    record = {"key": entry["key"], "scope": "group", "action": action,
+              "original": {"status": "multiple_attachments"}}
+    if action in {"document", "skip"}:
+        queue.finish()
+    else:
+        record["action"] = "blocked"
+        entry.update(group="multiple_attachments", original=record["original"],
+                     options=("document", "skip"), reason="multiple_attachments", recommended=None)
+        queue.finish(entry)
+    return record
+
+
 def plan_import(
     project,
     chat_id,
@@ -195,6 +230,8 @@ def plan_import(
     video_policy=None,
     media_tools=None,
     video_work=None,
+    video_decisions=None,
+    media_queue=None,
     annotate=False,
     record_kind="all",
 ):
@@ -220,6 +257,10 @@ def plan_import(
         raise RecoveryError("Проверьте профиль, режим дат и границы выборки.")
     if record_ranges is not None:
         record_ranges = decode_intervals(record_ranges)
+    video_decisions = validate_decisions(video_decisions)
+    if video_decisions and not video_policy:
+        video_policy = "original"
+    media_queue = media_queue or MediaQueue()
     starts = tuple(first for first, _ in record_ranges or ())
     date_policy = "historical"
     profile = PROFILES[profile]
@@ -241,6 +282,16 @@ def plan_import(
             )
         }
         total = db.execute("SELECT count(*) FROM messages WHERE chat=?", (chat_id,)).fetchone()[0]
+        planned_videos = 0
+        if video_policy and media_mode == "text_media":
+            planned_videos = db.execute(
+                """SELECT count(*) FROM messages m WHERE m.chat=? AND NOT m.service
+                AND coalesce(json_extract(m.meta,'$.source_ordinal'),?) BETWEEN ? AND ?
+                AND EXISTS (SELECT 1 FROM assets a WHERE a.msg=m.id AND a.kind IN ('video','round_video')
+                    AND a.status IN ('ok','unconfirmed_type'))""",
+                (chat_id, first_record, first_record, last_record or 2**31 - 1),
+            ).fetchone()[0]
+        media_queue.begin(planned_videos)
         rows = ordered_rows(db, chat_id)
         clock = WireClock(first_reliable_time(db, chat_id), zone, date_policy)
         duplicates = db.execute("SELECT count(*) FROM duplicates WHERE chat=?", (chat_id,)).fetchone()[0]
@@ -298,18 +349,18 @@ def plan_import(
                 )
                 grouped_video = bool(item and any(member["kind"] in VIDEO_KINDS for member in item.get("members", [])))
                 if video_policy and media_mode == "text_media" and grouped_video:
-                    if video_policy == "document":
+                    entry = _video_entry(item, meta, row, source_hash, chat_id, source_ordinal, grouped=True)
+                    video = _group_video(entry, video_decisions.get(entry["key"], video_policy), media_queue)
+                    if video["action"] == "document":
                         notes.append("group_video_document")
-                    elif video_policy == "skip":
+                    elif video["action"] == "skip":
                         notes = [key for key in notes if key != "grouped_media"]
                         item = plan_media(
                             [a for a in assets if a["kind"] not in VIDEO_KINDS], meta,
                             len(media) + 1, notes, missing_references=False,
                         )
                         notes.append("video_skipped")
-                        video = {"action": "skip", "scope": "group"}
                     else:
-                        video = {"action": "blocked", "scope": "group", "original": {"status": "multiple_attachments"}}
                         reason = "video_decision"
                         item = None
                 if (
@@ -318,7 +369,11 @@ def plan_import(
                 ):
                     source = Path(project).joinpath("source", *safe_parts(item["source"]))
                     notes = [note for note in notes if note not in {"document_fallback", "media_attributes"}]
-                    item, video = prepare_video(item, source, video_policy, media_tools, progress, video_work)
+                    entry = _video_entry(item, meta, row, source_hash, chat_id, source_ordinal)
+                    item, video = queue_video(
+                        item, source, video_policy, media_tools, progress, video_work, media_queue, entry,
+                        video_decisions.get(entry["key"]),
+                    )
                     if video["action"] == "blocked":
                         reason = "video_decision"
                     elif key := {"document": "video_document", "skip": "video_skipped",
@@ -416,6 +471,7 @@ def plan_import(
                 notes.extend(_text_losses(row, flags, meta))
             records.append(record)
             losses.update(notes)
+    media_queue.settle()
     return {
         "schema": 3,
         "filename_version": 1,
@@ -428,6 +484,8 @@ def plan_import(
         "date_policy": date_policy,
         "media_mode": media_mode,
         **({"video_policy": video_policy} if video_policy else {}),
+        **({"video_decisions": video_decisions} if video_decisions else {}),
+        **({"media_decisions_required": media_queue.entries} if media_queue.entries else {}),
         **({"annotate": True} if annotate else {}),
         "album_count": len(album_ids),
         "media_count": len(media),
@@ -483,6 +541,8 @@ def prepare(
     test_reset_id=None,
     video_policy=None,
     media_tools=None,
+    video_decisions=None,
+    media_queue=None,
     annotate=False,
     record_kind="all",
 ):
@@ -495,6 +555,7 @@ def prepare(
         raise RecoveryError("Недопустимый номер тестового цикла.")
     with catalogue(project) as db:
         original = Path(properties(db)["original"])
+    media_queue = media_queue or MediaQueue()
     with new_directory(dest, (project, original)) as work:
         with (work / "_chat.txt").open("xb") as transcript:
             data = plan_import(
@@ -513,14 +574,13 @@ def prepare(
                 video_policy=video_policy,
                 media_tools=media_tools,
                 video_work=work / ".video",
+                video_decisions=video_decisions,
+                media_queue=media_queue,
                 annotate=annotate,
                 record_kind=record_kind,
             )
-        if data["losses"].get("video_decision"):
-            raise RecoveryError(
-                f"Для {data['losses']['video_decision']} видео выберите совместимую копию, документ или пропуск. "
-                "Сначала откройте локальный план для просмотра причин."
-            )
+        if data.get("media_decisions_required"):
+            raise MediaDecisionRequired(data["media_decisions_required"])
         if record_ranges is not None:
             actual = included_intervals(data["records"])
             reviewed = decode_intervals(record_ranges)
@@ -541,7 +601,7 @@ def prepare(
         estimated = sum(item["size"] for item in data["media"])
         if estimated > MAX_TOTAL_BYTES:
             raise RecoveryError("Объём вложений превышает локальный предел пакета.")
-        _require_space(work, estimated)
+        _require_space(work, sum(item["size"] for item in data["media"] if not item.get("transform")))
         for i, item in enumerate(data["media"], 1):
             path = work / "media" / item["storage_name"]
             if item.get("transform"):
@@ -566,10 +626,14 @@ def prepare(
             encode_manifest(data, output, progress)
         (work / "report.html").write_text(package_html(data), encoding="utf-8")
         progress("finish", 1, 1)
+    media_queue.settle(ready=True)
     return Bundle(dest, data)
 
 
-def prepare_eligible(project, bundle, dest, eligible, progress=quiet):
+def prepare_eligible(
+    project, bundle, dest, eligible, progress=quiet, *, video_decisions=None,
+    media_queue=None, media_tools=None, video_policy=None,
+):
     """Regenerate only the reviewed eligible records from the associated source project."""
     from .integrity import check_local
 
@@ -580,6 +644,12 @@ def prepare_eligible(project, bundle, dest, eligible, progress=quiet):
     if project is None or check_local(bundle, project, progress)["status"] != "verified":
         raise RecoveryError("Откройте и проверьте исходный проект этого пакета.")
     profile = next(name for name, value in PROFILES.items() if value == bundle.data["profile"])
+    overrides = dict(validate_decisions(video_decisions))
+    for row in bundle.data["records"]:
+        previous = row.get("video_recovery", {})
+        key = previous.get("key")
+        if previous.get("method") == "remux" and overrides.get(key) == "compatible":
+            overrides[key] = "reencode"
     return prepare(
         project,
         bundle.data["chat_id"],
@@ -592,7 +662,10 @@ def prepare_eligible(project, bundle, dest, eligible, progress=quiet):
         fixture=bundle.data.get("fixture"),
         record_ranges=eligible,
         test_reset_id=bundle.data.get("test_reset_id"),
-        video_policy=bundle.data.get("video_policy"),
+        video_policy=video_policy or bundle.data.get("video_policy"),
+        video_decisions={**bundle.data.get("video_decisions", {}), **overrides},
+        media_queue=media_queue,
+        media_tools=media_tools,
         annotate=bundle.data.get("annotate", False),
         record_kind=bundle.data.get("selection", {}).get("record_kind", "all"),
     )
@@ -660,6 +733,12 @@ def load_bundle(root, progress=quiet):
                     raise ValueError
                 previous=pos
         mode = data.get("media_mode", "text_media")
+        choices = validate_decisions(data.get("video_decisions"))
+        converted = {
+            row.get("media") for row in data["records"]
+            if (decision := row.get("video_recovery")) and decision.get("action") == "convert"
+            and choices.get(decision.get("key")) in {"compatible", "reencode"}
+        }
         if data.get("video_policy") not in (None, *VIDEO_POLICIES):
             raise ValueError
         if (
@@ -759,7 +838,7 @@ def load_bundle(root, progress=quiet):
                 raise ValueError
             transform = item.get("transform")
             if transform and (
-                not isinstance(transform, dict) or data.get("video_policy") != "compatible"
+                not isinstance(transform, dict) or (data.get("video_policy") != "compatible" and name not in converted)
                 or transform.get("type") != "mp4_h264_aac" or item["mime"] != "video/mp4"
                 or not re.fullmatch(r"[a-f0-9]{64}", transform.get("original_sha256", ""))
                 or item.get("attributes", {}).get("video_codec") != "h264"

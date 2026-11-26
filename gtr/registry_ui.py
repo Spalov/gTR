@@ -402,7 +402,7 @@ class ProfilesPage(QWidget):
         test_reset_id = self.preview[3]
         p = self.choice.currentData()
 
-        def job(progress):
+        def job(progress, **media):
             journal = Journal(
                 app_home() / "imports.sqlite",
                 Endpoint.telegram(account, p["target_id"], p["kind"]),
@@ -422,6 +422,7 @@ class ProfilesPage(QWidget):
                 record_ranges=expected,
                 test_reset_id=test_reset_id,
                 **video,
+                **media,
             )
             if (
                 check_local(package, project, progress)["status"] != "verified"
@@ -463,7 +464,7 @@ class ProfilesPage(QWidget):
             )
             return panel.state.text()
 
-        self.window.run_job("Подготовка новых сообщений", job, ready)
+        self.window.run_media_job("Подготовка новых сообщений", job, ready, project=project)
 
 
 class HistoryPage(QWidget):

@@ -14,6 +14,7 @@ from zoneinfo import available_timezones
 from PySide6.QtCore import (
     QLibraryInfo,
     QSettings,
+    QSignalBlocker,
     Qt,
     QThread,
     QTimer,
@@ -69,6 +70,14 @@ from .journal import PHASE_NAMES, Journal
 from .library import Library, Participants, fill, table
 from .media_engine import inspect_project, public_inventory
 from .media_preview import FFmpegThumbnail
+from .media_queue import (
+    MediaDecisionRequired,
+    MediaQueue,
+    cache_info,
+    clean_cache,
+    validate_decisions,
+)
+from .media_queue_ui import CompatibilityDialog, QueueDisplay, media_size
 from .mock_api import SCENARIOS, rehearse
 from .model import Cancelled, RecoveryError
 from .owner import app_home
@@ -152,6 +161,7 @@ STAGES = {
     "verify_update": "Сверка архива с GitHub",
     "extract_update": "Установка версии gTR",
     "probe_media": "Чтение и декодирование медиа",
+    "media_cache_copy": "Копирование подготовленного видео",
 }
 STYLE = """
 QWidget { color:#e6edeb; font-size:10pt; }
@@ -201,6 +211,7 @@ class Worker(QThread):
     update = Signal(str, int, int)
     result = Signal(object)
     error = Signal(str)
+    decision = Signal(object)
 
     def __init__(self, job, parent):
         super().__init__(parent)
@@ -224,6 +235,8 @@ class Worker(QThread):
 
         try:
             self.result.emit(self.job(report))
+        except MediaDecisionRequired as exc:
+            self.decision.emit(exc)
         except RecoveryError as exc:
             self.error.emit(str(exc))
         except Exception:  # noqa: BLE001 - keep details about local files out of the UI log
@@ -255,6 +268,8 @@ def page():
 
 
 class Window(QMainWindow):
+    media_queue_changed = Signal(object)
+
     def __init__(self, project=None, *, telegram_factory=TelegramControls):
         super().__init__()
         self.setWindowTitle(f"gTR {__version__}")
@@ -267,6 +282,9 @@ class Window(QMainWindow):
         self.plan_data = self.comparison = None
         self.planned = False
         self.after_job = None
+        self.after_media_decision = None
+        self.pending_media_decision = None
+        self.media_auto_controls = []
         self.close_pending = False
         self.stats = {}
         self.restart_folder = None
@@ -375,6 +393,8 @@ class Window(QMainWindow):
                 self.profiles_page.reload(getattr(self, "requested_profile", None))
             if index == Section.HISTORY:
                 self.history_page.reload()
+            if index == Section.SETTINGS:
+                self.update_media_cache_summary()
 
     def show_import_profiles(self, preferred=None):
         self.requested_profile = preferred if isinstance(preferred, tuple) else None
@@ -531,80 +551,81 @@ class Window(QMainWindow):
         self.import_tabs = QTabWidget()
         w, layout = page()
         box, group = panel()
-        group.addWidget(label("Диалог и профиль", "section"))
-        group.addWidget(button("Продолжить импорт", self.show_import_profiles))
+        group.addWidget(label(tr("Диалог и профиль"), "section"))
+        group.addWidget(button(tr("Продолжить импорт"), self.show_import_profiles))
         group.addWidget(
             label(
-                "Выберите один диалог. Пакет содержит текст, оригиналы вложений и отчёт о потерях.", "muted"
+                tr("Выберите один диалог. Пакет содержит текст, оригиналы вложений и отчёт о потерях."), "muted"
             )
         )
         self.import_chat = QComboBox()
-        self.import_chat.setPlaceholderText("Выберите диалог")
+        self.import_chat.setPlaceholderText(tr("Выберите диалог"))
         self.import_profile = QComboBox()
-        self.import_profile.addItem("Профиль iOS", "ios")
-        self.import_profile.addItem("Профиль Android", "android")
+        self.import_profile.addItem(tr("Профиль iOS"), "ios")
+        self.import_profile.addItem(tr("Профиль Android"), "android")
         self.import_sample = QComboBox()
-        self.import_sample.addItem("Вся переписка", None)
+        self.import_sample.addItem(tr("Вся переписка"), None)
         for limit in (2, 10, 20, 100, 1000, 10000):
-            self.import_sample.addItem(f"Первые {number(limit)}", limit)
+            self.import_sample.addItem(tr('Первые {0}').format(number(limit)), limit)
         for choice in (self.import_chat, self.import_profile, self.import_sample):
             choice.setMinimumHeight(25)
         group.addLayout(row(self.import_chat, self.import_profile, self.import_sample))
         self.import_time = QComboBox()
-        self.import_time.addItem("Исходные даты и время", "historical")
-        group.addWidget(label("Исходные даты и время", "muted"))
+        self.import_time.addItem(tr("Исходные даты и время"), "historical")
+        group.addWidget(label(tr("Исходные даты и время"), "muted"))
         self.import_mode = QComboBox()
-        self.import_mode.setAccessibleName("Состав пакета истории")
-        self.import_mode.addItem("Текст и медиа", "text_media")
-        self.import_mode.addItem("Только текст (для первого теста)", "text_only")
-        self.import_mode.addItem("Текст и медиа как документы", "document")
+        self.import_mode.setAccessibleName(tr("Состав пакета истории"))
+        self.import_mode.addItem(tr("Текст и медиа"), "text_media")
+        self.import_mode.addItem(tr("Только текст (для первого теста)"), "text_only")
+        self.import_mode.addItem(tr("Текст и медиа как документы"), "document")
         group.addLayout(row(self.import_mode))
         self.import_video = QComboBox()
-        self.import_video.setAccessibleName("Как подготовить видео")
+        self.import_video.setAccessibleName(tr("Как подготовить видео"))
         for key, name in VIDEO_POLICIES.items():
             self.import_video.addItem(tr(name), key)
         group.addLayout(row(label(tr("Видео")), self.import_video))
+        group.addWidget(self.auto_video_checkbox())
         self.import_kind = QComboBox()
         for key, name in RECORD_KINDS.items():
             self.import_kind.addItem(tr(name), key)
-        group.addLayout(row(label("Тип исходной записи"), self.import_kind))
+        group.addLayout(row(label(tr("Тип исходной записи")), self.import_kind))
         self.import_notes = self.notes_checkbox()
         group.addWidget(self.import_notes)
         group.addLayout(
             row(
-                button("Подготовить пакет…", self.make_bundle, True),
-                button("Оценить перенос", self.preview_plan),
-                button("Открыть готовый…", self.select_bundle),
-                button("Предпросмотр", self.preview_import_chat),
+                button(tr("Подготовить пакет…"), self.make_bundle, True),
+                button(tr("Оценить перенос"), self.preview_plan),
+                button(tr("Открыть готовый…"), self.select_bundle),
+                button(tr("Предпросмотр"), self.preview_import_chat),
             )
         )
-        self.bundle_summary = label("Пакет ещё не выбран.", "secondary")
+        self.bundle_summary = label(tr("Пакет ещё не выбран."), "secondary")
         group.addWidget(self.bundle_summary)
         layout.addWidget(box)
-        self.plan_table = table(("Ограничение или преобразование", "Записи"))
+        self.plan_table = table((tr("Ограничение или преобразование"), tr("Записи")))
         layout.addWidget(self.plan_table, 1)
         self.plan_totals = label("", "muted")
         layout.addWidget(self.plan_totals)
-        layout.addLayout(row(button("Сохранить отчёт…", self.export_import_report)))
+        layout.addLayout(row(button(tr("Сохранить отчёт…"), self.export_import_report)))
         self.import_tabs.addTab(w, tr("Пакет истории"))
         self.import_tabs.addTab(self.telegram.server_page, tr("Серверный импорт"))
         operations, layout = page()
         box, group = panel()
-        group.addWidget(label("Локальная проверка", "section"))
+        group.addWidget(label(tr("Локальная проверка"), "section"))
         self.scenario = QComboBox()
         for code, (title, _, _) in SCENARIOS.items():
             self.scenario.addItem(title, code)
-        group.addLayout(row(self.scenario, button("Запустить Mock API", self.simulate)))
+        group.addLayout(row(self.scenario, button(tr("Запустить Mock API"), self.simulate)))
         group.addLayout(
             row(
-                button("Два тестовых сообщения…", lambda: self.make_fixture("text")),
-                button("Тест медиа…", lambda: self.make_fixture("media")),
+                button(tr("Два тестовых сообщения…"), lambda: self.make_fixture("text")),
+                button(tr("Тест медиа…"), lambda: self.make_fixture("media")),
             )
         )
         layout.addWidget(box)
         box, group = panel()
-        group.addWidget(label("Консоль владельца", "section"))
-        group.addLayout(row(button("Открыть окно владельца…", self.owner_console)))
+        group.addWidget(label(tr("Консоль владельца"), "section"))
+        group.addLayout(row(button(tr("Открыть окно владельца…"), self.owner_console)))
         layout.addWidget(box)
         layout.addStretch()
         self.import_tabs.addTab(operations, tr("Локальная имитация"))
@@ -627,10 +648,20 @@ class Window(QMainWindow):
 
         self.run_job(title, job, display)
 
+    def run_recovery_media_job(self, title, job, ready, *, project, decisions=None):
+        previous_tab = self.import_tabs.currentWidget()
+
+        def display(value):
+            self.import_tabs.setCurrentWidget(previous_tab)
+            self.navigate_to(Section.IMPORT)
+            return ready(value)
+
+        self.run_media_job(title, job, display, project=project, decisions=decisions)
+
     def use_recovery_bundle(self, bundle):
         in_wizard = self.import_tabs.currentWidget() is self.wizard
         self.use_bundle(bundle)
-        message = "Сохранён отдельный пакет новых записей. Проверьте его и подтвердите согласие заново."
+        message = tr("Сохранён отдельный пакет новых записей. Проверьте его и подтвердите согласие заново.")
         if in_wizard:
             self.wizard.package_ready(bundle)
         else:
@@ -641,9 +672,9 @@ class Window(QMainWindow):
     def open_recovery_verification(self, bundle):
         self.use_bundle(bundle)
         self.import_tabs.setCurrentWidget(self.telegram.server_page)
-        message = "Открыт пакет предыдущей операции. Сохраните независимые снимки с двух аккаунтов."
+        message = tr("Открыт пакет предыдущей операции. Сохраните независимые снимки с двух аккаунтов.")
         self.telegram.state.setText(message)
-        self.telegram.details.setText("Сравните сохранённые снимки во вкладке «Верификация».")
+        self.telegram.details.setText(tr("Сравните сохранённые снимки во вкладке «Верификация»."))
         return message
 
     def finish_import_wizard(self):
@@ -652,15 +683,18 @@ class Window(QMainWindow):
     def progress_page(self):
         w, layout = page()
         box, group = panel()
-        self.job_title = label("Активных операций нет", "heroTitle")
-        self.stage = label("Здесь появятся этап и результат операции.", "muted")
+        self.job_title = label(tr("Активных операций нет"), "heroTitle")
+        self.stage = label(tr("Здесь появятся этап и результат операции."), "muted")
+        self.media_queue_display = QueueDisplay()
+        self.media_queue_changed.connect(self.media_queue_display.update_status)
         self.bar = QProgressBar()
         self.bar.setTextVisible(False)
         self.bar.setValue(0)
-        self.stop_btn = button("Остановить", self.stop_job)
+        self.stop_btn = button(tr("Остановить"), self.stop_job)
         self.stop_btn.setEnabled(False)
         group.addWidget(self.job_title)
         group.addWidget(self.stage)
+        group.addWidget(self.media_queue_display)
         group.addSpacing(8)
         group.addWidget(self.bar)
         group.addLayout(row(self.stop_btn))
@@ -836,17 +870,17 @@ class Window(QMainWindow):
             language.addItem(name, code)
         language.setCurrentIndex(max(0, language.findData(self.settings.value("language", "ru"))))
         language.currentIndexChanged.connect(lambda: self.save_language(language.currentData()))
-        layout.addLayout(row(label("Язык / Мова"), language))
+        layout.addLayout(row(label(tr("Язык / Мова")), language))
         if updates.portable():
             box, group = panel()
-            group.addWidget(label("Обновление программы", "section"))
-            group.addLayout(row(button("Выбрать скачанное обновление…", self.choose_update)))
+            group.addWidget(label(tr("Обновление программы"), "section"))
+            group.addLayout(row(button(tr("Выбрать скачанное обновление…"), self.choose_update)))
             layout.addWidget(box)
         box, group = panel()
-        group.addWidget(label("Часовой пояс", "section"))
+        group.addWidget(label(tr("Часовой пояс"), "section"))
         group.addWidget(
             label(
-                "Для дат без смещения и для времени в файле импорта. Исходные даты хранятся в проекте.",
+                tr("Для дат без смещения и для времени в файле импорта. Исходные даты хранятся в проекте."),
                 "muted",
             )
         )
@@ -856,37 +890,42 @@ class Window(QMainWindow):
         self.timezone.setCurrentText(self.settings.value("timezone", "UTC"))
         group.addWidget(self.timezone)
         self.display_zone = QComboBox()
-        self.display_zone.addItems(["Показывать время источника", "Показывать в выбранном поясе"])
+        self.display_zone.addItems([tr("Показывать время источника"), tr("Показывать в выбранном поясе")])
         self.display_zone.setCurrentIndex(self.settings.value("display_zone", 0, type=int))
         self.forwards.zone = self.viewer.zone = (
             self.timezone.currentText() if self.display_zone.currentIndex() else ""
         )
         group.addWidget(self.display_zone)
-        group.addLayout(row(button("Сохранить настройки", self.save_settings)))
+        group.addLayout(row(button(tr("Сохранить настройки"), self.save_settings)))
         layout.addWidget(box)
         box, group = panel()
-        group.addWidget(label("Хранение на компьютере", "section"))
+        group.addWidget(label(tr("Хранение на компьютере"), "section"))
         group.addWidget(label(str(app_home()), "muted"))
         group.addWidget(
             label(
-                "Проекты, пакеты, отчёты и временные копии содержат личные данные в открытом виде. DPAPI защищает сохранённую сессию Telegram.",
+                tr("Проекты, пакеты, отчёты и временные копии содержат личные данные в открытом виде. DPAPI защищает сохранённую сессию Telegram."),
                 "muted",
             )
         )
-        group.addLayout(row(button("Открыть папку локальных данных", self.open_storage)))
+        group.addLayout(row(button(tr("Открыть папку локальных данных"), self.open_storage)))
         layout.addWidget(box)
         box, group = panel()
-        group.addWidget(label("FFmpeg и FFprobe", "section"))
+        group.addWidget(label(tr("FFmpeg и FFprobe"), "section"))
         self.ffmpeg_status = label("", "muted")
         group.addWidget(self.ffmpeg_status)
         self.update_ffmpeg_status()
         group.addLayout(
             row(
-                button("Выбрать FFmpeg…", self.choose_ffmpeg),
-                button("Выбрать FFprobe…", self.choose_ffprobe),
-                button("Автоопределение", self.disable_ffmpeg),
+                button(tr("Выбрать FFmpeg…"), self.choose_ffmpeg),
+                button(tr("Выбрать FFprobe…"), self.choose_ffprobe),
+                button(tr("Автоопределение"), self.disable_ffmpeg),
             )
         )
+        group.addWidget(self.auto_video_checkbox())
+        self.media_cache_summary = label("", "muted")
+        group.addWidget(self.media_cache_summary)
+        self.update_media_cache_summary()
+        group.addLayout(row(button(tr("Очистить кеш подготовленных видео…"), self.clear_media_cache)))
         layout.addWidget(box)
         layout.addStretch()
         return w
@@ -895,7 +934,7 @@ class Window(QMainWindow):
         self.downloaded_update = updates.find_download()
         self.update_hint.setVisible(self.downloaded_update is not None)
         if self.downloaded_update:
-            self.update_hint.setText(f"Найдена Beta {self.downloaded_update.number}…")
+            self.update_hint.setText(tr("Найдена {version}…").format(version=self.downloaded_update.label))
 
     def choose_update(self):
         path, _ = QFileDialog.getOpenFileName(self, "Архив обновления gTR", str(updates.downloads()), "Архив ZIP (*.zip)")
@@ -911,8 +950,8 @@ class Window(QMainWindow):
             return
         if QMessageBox.question(
             self, "Обновление gTR",
-            f"Установить Beta {update.number}? gTR сверит архив с выпуском на GitHub "
-            "и перезапустится. Проекты и настройки останутся доступны.",
+            tr("Установить {version}? gTR сверит архив с выпуском на GitHub и перезапустится. "
+               "Проекты и настройки останутся доступны.").format(version=update.label),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
@@ -928,8 +967,8 @@ class Window(QMainWindow):
     def update_ffmpeg_status(self):
         tools = self.video_tools()
         self.ffmpeg_status.setText(
-            f"FFmpeg — {'доступен' if tools.ffmpeg else 'не найден'} · "
-            f"FFprobe — {'доступен' if tools.ffprobe else 'не найден'}"
+            f"FFmpeg — {tr('доступен' if tools.ffmpeg else 'не найден')} · "
+            f"FFprobe — {tr('доступен' if tools.ffprobe else 'не найден')}"
         )
 
     def video_tools(self):
@@ -942,23 +981,73 @@ class Window(QMainWindow):
     def notes_checkbox(self):
         return QCheckBox(tr("Добавлять исторические пометки о пересылках и цитатах"))
 
+    def auto_video_checkbox(self):
+        control = QCheckBox(tr("Автоматически подготавливать совместимые видео"))
+        control.setToolTip(tr("Разрешает создавать совместимые копии только для несовместимых видео."))
+        control.setChecked(self.settings.value("auto_media_compatibility", False, type=bool))
+        self.media_auto_controls.append(control)
+        control.toggled.connect(self.change_auto_video)
+        return control
+
+    def change_auto_video(self, enabled):
+        self.settings.setValue("auto_media_compatibility", enabled)
+        for control in self.media_auto_controls:
+            with QSignalBlocker(control):
+                control.setChecked(enabled)
+        if hasattr(self, "wizard"):
+            self.wizard.invalidate_review()
+
+    def effective_video_policy(self, policy):
+        if (policy is None or policy == "original") and self.settings.value("auto_media_compatibility", False, type=bool):
+            return "compatible"
+        return policy or "original"
+
+    def update_media_cache_summary(self):
+        try:
+            info = cache_info()
+        except (OSError, RecoveryError):
+            self.media_cache_summary.setText(tr("Кеш подготовленных видео недоступен."))
+            return
+        self.media_cache_summary.setText(tr("Кеш подготовленных видео · {files} файлов · {size}").format(
+            files=number(info["files"]), size=media_size(info["size"]),
+        ))
+
+    def clear_media_cache(self):
+        if self.worker or self.telegram.busy:
+            self.info(tr("Дождитесь окончания текущей операции."))
+            return
+        answer = QMessageBox.question(
+            self, tr("Кеш подготовленных видео"),
+            tr("Удалить неиспользуемые копии из кеша?"),
+            defaultButton=QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        def ready(info):
+            self.update_media_cache_summary()
+            self.navigate_to(Section.SETTINGS)
+            return tr("Освобождено {size}").format(size=media_size(info["size"]))
+
+        self.run_job(tr("Очистка кеша подготовленных видео"), lambda _: clean_cache(), ready)
+
     def video_options(self, policy=None, *, annotate=None):
         return {
             "media_tools": self.video_tools(),
-            "video_policy": policy or self.import_video.currentData(),
+            "video_policy": self.effective_video_policy(policy or self.import_video.currentData()),
             "annotate": self.import_notes.isChecked() if annotate is None else annotate,
         }
 
     def choose_ffprobe(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Выбрать FFprobe", "", "Программа (ffprobe.exe)")
+        file, _ = QFileDialog.getOpenFileName(self, tr("Выбрать FFprobe"), "", tr("Программа (ffprobe.exe)"))
         if file and (path := tool_path("ffprobe", file)):
             self.settings.setValue("ffprobe", str(path))
             self.update_ffmpeg_status()
         elif file:
-            self.info("Выберите установленный ffprobe.exe.")
+            self.info(tr("Выберите установленный ffprobe.exe."))
 
     def choose_ffmpeg(self):
-        file, _ = QFileDialog.getOpenFileName(self, "Выбрать программу FFmpeg", "", "Программа (ffmpeg.exe)")
+        file, _ = QFileDialog.getOpenFileName(self, tr("Выбрать программу FFmpeg"), "", tr("Программа (ffmpeg.exe)"))
         if file:
             try:
                 provider = FFmpegThumbnail(Path(file))
@@ -1240,7 +1329,7 @@ class Window(QMainWindow):
     def inspect_project_media(self, chat):
         project = self.project
         if project is None:
-            self.info("Сначала откройте проект.")
+            self.info(tr("Сначала откройте проект."))
             return
 
         def ready(report):
@@ -1248,18 +1337,18 @@ class Window(QMainWindow):
             return self.media.inspected(report)
 
         self.run_job(
-            "Проверка вложений проекта", lambda progress: inspect_project(project, chat, progress), ready
+            tr("Проверка вложений проекта"), lambda progress: inspect_project(project, chat, progress), ready
         )
 
     def save_media_inventory(self, report, protected=()):
         if not report:
             return
-        choices = ("Обезличенный отчёт", "Локальный отчёт с путями внутри архива и SHA-256")
-        choice, ok = QInputDialog.getItem(self, "Диагностика медиа", "Состав отчёта", choices, 0, False)
+        choices = (tr("Обезличенный отчёт"), tr("Локальный отчёт с путями внутри архива и SHA-256"))
+        choice, ok = QInputDialog.getItem(self, tr("Диагностика медиа"), tr("Состав отчёта"), choices, 0, False)
         if not ok:
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Сохранить проверку медиа", "gTR-media.json", "Отчёты JSON (*.json)"
+            self, tr("Сохранить проверку медиа"), "gTR-media.json", tr("Отчёты JSON (*.json)")
         )
         if not path:
             return
@@ -1271,17 +1360,17 @@ class Window(QMainWindow):
                 with catalogue(self.project) as db:
                     roots.extend((self.project, Path(properties(db)["original"])))
             if any(dest.is_relative_to(local(Path(root))) for root in roots):
-                raise RecoveryError("Сохраните отчёт отдельно от архива, проекта и пакета.")
+                raise RecoveryError(tr("Сохраните отчёт отдельно от архива, проекта и пакета."))
             data = report if choice == choices[1] else public_inventory(report)
             publish_text(dest, json.dumps(data, ensure_ascii=False, indent=2))
         except (OSError, sqlite3.Error, RecoveryError):
-            self.info("Не удалось сохранить отчёт. Выберите новый файл вне исходных данных.")
+            self.info(tr("Не удалось сохранить отчёт. Выберите новый файл вне исходных данных."))
 
     def make_bundle(self):
         if not self.project:
-            self.info("Сначала откройте проект.")
+            self.info(tr("Сначала откройте проект."))
             return
-        folder = QFileDialog.getExistingDirectory(self, "Куда поместить новую папку с пакетом")
+        folder = QFileDialog.getExistingDirectory(self, tr("Куда поместить новую папку с пакетом"))
         if folder:
             project, cid = self.project, self.import_chat.currentData()
             dest = Path(folder) / ("gTR-import-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
@@ -1289,9 +1378,9 @@ class Window(QMainWindow):
             policy, media_mode = self.import_time.currentData(), self.import_mode.currentData()
             video = self.video_options()
             kind = self.import_kind.currentData()
-            self.run_job(
-                "Подготовка пакета",
-                lambda p: prepare(
+            self.run_media_job(
+                tr("Подготовка пакета"),
+                lambda p, **media: prepare(
                     project,
                     cid,
                     dest,
@@ -1303,13 +1392,15 @@ class Window(QMainWindow):
                     media_mode=media_mode,
                     record_kind=kind,
                     **video,
+                    **media,
                 ),
                 self.use_bundle,
+                project=project,
             )
 
     def preview_plan(self):
         if not self.project:
-            self.info("Сначала откройте проект.")
+            self.info(tr("Сначала откройте проект."))
             return
         project, cid = self.project, self.import_chat.currentData()
         profile, sample = self.import_profile.currentData(), self.import_sample.currentData()
@@ -1321,7 +1412,7 @@ class Window(QMainWindow):
             return self.show_plan(data, True)
 
         self.run_job(
-            "Оценка состава пакета",
+            tr("Оценка состава пакета"),
             lambda p: plan_import(
                 project,
                 cid,
@@ -1345,10 +1436,10 @@ class Window(QMainWindow):
     def make_fixture(self, scenario):
         from .fixtures import prepare_fixture
 
-        if folder := QFileDialog.getExistingDirectory(self, "Куда сохранить отдельный тестовый пакет"):
+        if folder := QFileDialog.getExistingDirectory(self, tr("Куда сохранить отдельный тестовый пакет")):
             dest = Path(folder) / ("gTR-test-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
             self.run_job(
-                "Подготовка синтетического пакета",
+                tr("Подготовка синтетического пакета"),
                 lambda p: prepare_fixture(dest, scenario, p),
                 self.use_bundle,
             )
@@ -1356,27 +1447,24 @@ class Window(QMainWindow):
     def show_plan(self, data, planned):
         self.plan_data, self.planned = data, planned
         stats = plan_summary(data)
-        title = "Оценка" if planned else "Пакет проверен"
-        message = f"{title} · {number(stats['included'])} сообщений · {number(stats['attachments'])} вложений · {size_text(stats['media_bytes'])}"
+        title = tr("Оценка") if planned else tr("Пакет проверен")
+        message = tr('{0} · {1} сообщений · {2} вложений · {3}').format(title, number(stats['included']), number(stats['attachments']), size_text(stats['media_bytes']))
         if stats.get("media_mode") == "text_only":
-            message += " · Только текст"
+            message += tr(" · Только текст")
         if stats["skipped"]:
-            message += f" · {number(stats['skipped'])} пропущено"
+            message += tr(' · {0} пропущено').format(number(stats['skipped']))
         if stats.get("omitted_assets"):
-            message += f" · {number(stats['omitted_assets'])} вложений исключено режимом"
+            message += tr(' · {0} вложений исключено режимом').format(number(stats['omitted_assets']))
         self.bundle_summary.setText(message)
         fill(
             self.plan_table,
             sorted(data["losses"].items()),
-            lambda item: (LOSS.get(item[0], item[0]), number(item[1])),
+            lambda item: (tr(LOSS.get(item[0], item[0])), number(item[1])),
         )
         summary_line = (
-            f"Переслано {number(stats['forwards'])} · Ответов {number(stats['replies'])} · "
-            f"Элементов альбомов {number(stats['album_elements'])} · Нет файлов {number(stats['missing_assets'])} · "
-            f"Несовместимых или непроверенных видео {number(stats['video_incompatible'])} · "
-            f"Записей с пометками {number(stats['annotated_records'])}."
+            tr('Переслано {0} · Ответов {1} · Элементов альбомов {2} · Нет файлов {3} · Несовместимых или непроверенных видео {4} · Записей с пометками {5}.').format(number(stats['forwards']), number(stats['replies']), number(stats['album_elements']), number(stats['missing_assets']), number(stats['video_incompatible']), number(stats['annotated_records']))
         )
-        self.plan_totals.setText(summary_line + "\n" + LOCAL + " " + SERVER)
+        self.plan_totals.setText(summary_line + "\n" + tr(LOCAL) + " " + tr(SERVER))
         self.import_tabs.setCurrentIndex(0)
         self.navigate_to(Section.IMPORT)
         return message
@@ -1391,15 +1479,15 @@ class Window(QMainWindow):
         self.telegram.set_package(bundle, project, origin)
         self.comparison = None
         self.recovery.bind(None)
-        self.verdict.setText("Пакет открыт. Можно сравнить два снимка.")
-        self.levels.setText("A · Проект    B1 · История на сервере    B2 · Нативное авторство    C · Клиенты")
+        self.verdict.setText(tr("Пакет открыт. Можно сравнить два снимка."))
+        self.levels.setText(tr("A · Проект    B1 · История на сервере    B2 · Нативное авторство    C · Клиенты"))
         self.overview.set_quality(None)
         self.evidence_table.setRowCount(0)
         return self.show_plan(bundle.data, False)
 
     def select_bundle(self, *, on_ready=None):
         path = QFileDialog.getExistingDirectory(
-            self, "Папка с manifest.json и _chat.txt", str(app_home() / "packages")
+            self, tr("Папка с manifest.json и _chat.txt"), str(app_home() / "packages")
         )
         if path:
 
@@ -1409,7 +1497,7 @@ class Window(QMainWindow):
                     on_ready(bundle)
                 return message
 
-            self.run_job("Проверка пакета", lambda p: load_bundle(path, p), ready)
+            self.run_job(tr("Проверка пакета"), lambda p: load_bundle(path, p), ready)
 
     def simulate(self):
         if not self.bundle:
@@ -1623,20 +1711,77 @@ class Window(QMainWindow):
         except (OSError, AttributeError):
             self.info("Не удалось открыть консоль владельца. Воспользуйтесь командой live из инструкции.")
 
-    def run_job(self, title, job, ready):
+    def run_media_job(self, title, job, ready, *, project, decisions=None):
         if self.worker or self.telegram.busy:
-            self.info("Дождитесь окончания текущей операции.")
+            self.info(tr("Дождитесь окончания текущей операции."))
+            return
+        queue = MediaQueue(self.media_queue_changed.emit)
+        decisions = dict(decisions or {})
+        saved = self.saved_video_decisions()
+
+        def remember():
+            saved.update(decisions)
+            self.save_video_decisions(saved)
+
+        def work(progress):
+            return job(progress, media_queue=queue, video_decisions=decisions)
+
+        def complete(value):
+            result = ready(value)
+            for key in decisions:
+                saved.pop(key, None)
+            self.save_video_decisions(saved)
+            return result
+
+        def review(error):
+            dialog = CompatibilityDialog(self, error.entries, project, self.video_tools(), initial=saved)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                decisions.update(dialog.decisions())
+                remember()
+                self.run_job(tr("Продолжение подготовки"), work, complete, on_media_decision=review)
+            else:
+                self.stage.setText(tr("Подготовка отменена"))
+                self.bar.setRange(0, 1)
+                self.bar.setValue(0)
+                self.outcome.setText(tr("Совместимые копии можно использовать при следующей подготовке."))
+            dialog.deleteLater()
+
+        if decisions:
+            remember()
+        self.run_job(title, work, complete, on_media_decision=review)
+
+    def saved_video_decisions(self):
+        data = self.settings.value("pending_media_decisions", "{}", type=str)
+        try:
+            return validate_decisions(json.loads(data))
+        except (ValueError, RecoveryError):
+            return {}
+
+    def save_video_decisions(self, decisions):
+        if decisions:
+            self.settings.setValue("pending_media_decisions", json.dumps(decisions, separators=(",", ":")))
+        else:
+            self.settings.remove("pending_media_decisions")
+        self.settings.sync()
+
+    def run_job(self, title, job, ready, *, on_media_decision=None):
+        if self.worker or self.telegram.busy:
+            self.info(tr("Дождитесь окончания текущей операции."))
             return
         self.after_job = ready
+        self.after_media_decision = on_media_decision
+        self.pending_media_decision = None
         self.worker = Worker(job, self)
         self.worker.update.connect(self.progress)
         self.worker.result.connect(self.job_done)
         self.worker.error.connect(self.job_error)
+        self.worker.decision.connect(self.job_waiting_for_media)
         self.worker.finished.connect(self.finished)
-        self.job_title.setText(title)
-        self.log(title)
+        self.job_title.setText(tr(title))
+        self.log(tr(title))
         self.outcome.clear()
-        self.stage.setText("Начато")
+        self.media_queue_display.hide()
+        self.stage.setText(tr("Начато"))
         self.stop_btn.setEnabled(True)
         self.bar.setRange(0, 0)
         self.navigate_to(Section.PROGRESS)
@@ -1645,28 +1790,35 @@ class Window(QMainWindow):
 
     def progress(self, stage, done, total):
         self.stage.setText(
-            STAGES.get(stage, stage) + (f"   {number(done)} / {number(total)}" if total else "")
+            tr(STAGES.get(stage, stage)) + (f"   {number(done)} / {number(total)}" if total else "")
         )
         self.bar.setRange(0, total)
         self.bar.setValue(done)
 
     def job_done(self, value):
         try:
-            self.outcome.setText(self.after_job(value))
-            self.stage.setText("Готово")
+            self.outcome.setText(tr(self.after_job(value)))
+            self.stage.setText(tr("Готово"))
             self.bar.setRange(0, 1)
             self.bar.setValue(1)
-            self.log("Операция завершена.")
+            self.log(tr("Операция завершена."))
         except (OSError, RecoveryError):
-            self.job_error("Не удалось открыть сохранённый результат.")
+            self.job_error(tr("Не удалось открыть сохранённый результат."))
 
     def job_error(self, safe_message):
         self.bar.setRange(0, 1)
         self.bar.setValue(0)
-        if self.stage.text() != "Ограничение Telegram":
-            self.stage.setText("Операция остановлена")
-        self.outcome.setText(safe_message)
-        self.log(safe_message)
+        if self.stage.text() != tr("Ограничение Telegram"):
+            self.stage.setText(tr("Операция остановлена"))
+        self.outcome.setText(tr(safe_message))
+        self.log(tr(safe_message))
+
+    def job_waiting_for_media(self, error):
+        self.pending_media_decision = error
+        self.bar.setRange(0, 1)
+        self.bar.setValue(0)
+        self.stage.setText(tr("Ожидание решения пользователя"))
+        self.outcome.setText(tr("Выберите способ обработки видео для продолжения."))
 
     def stop_job(self):
         if self.worker:
@@ -1680,6 +1832,10 @@ class Window(QMainWindow):
         self.telegram.refresh()
         if self.close_pending:
             self.close()
+        elif self.pending_media_decision:
+            error, self.pending_media_decision = self.pending_media_decision, None
+            if review := self.after_media_decision:
+                review(error)
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

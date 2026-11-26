@@ -41,7 +41,10 @@ from .account import AccountProfile
 from .conversion import load_bundle, prepare_eligible
 from .dashboard import label, number, panel, size_text
 from .faults import ImportFault
+from .i18n import tr
 from .journal import PHASE_NAMES, RecoveryRequired
+from .media_queue import video_decision_key
+from .media_queue_ui import CompatibilityDialog
 from .model import Cancelled, RecoveryError
 from .observation import CaptureWindow
 from .owner import api_vault_path, journal_for, vault_path
@@ -297,43 +300,43 @@ class TelegramControls(QObject):
         widget, layout = _scroll()
         box, body = panel()
         header = QHBoxLayout()
-        self.server_account = label("Подключите аккаунт в Telegram.", "muted")
+        self.server_account = label(tr("Подключите аккаунт в Telegram."), "muted")
         header.addWidget(self.server_account, 1)
-        header.addWidget(_button("Управление аккаунтом", self.go_to_account))
+        header.addWidget(_button(tr("Управление аккаунтом"), self.go_to_account))
         body.addLayout(header)
         self.target = QComboBox()
-        self.target.setAccessibleName("Целевой диалог")
-        self.target.setPlaceholderText("Выберите целевой диалог")
+        self.target.setAccessibleName(tr("Целевой диалог"))
+        self.target.setPlaceholderText(tr("Выберите целевой диалог"))
         self.target.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.target.setMinimumContentsLength(30)
         self.target.currentIndexChanged.connect(self.select_target)
         body.addWidget(self.target)
-        self.source = label("Подготовьте или откройте пакет на соседней вкладке.", "muted")
+        self.source = label(tr("Подготовьте или откройте пакет на соседней вкладке."), "muted")
         self.source.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         body.addWidget(self.source)
         self.plan = label("", "secondary")
         body.addWidget(self.plan)
         self.local_status = label(
-            "Пакет — ожидается   ·   Формат Telegram — ожидается   ·   Диалог — ожидается", "muted"
+            tr("Пакет — ожидается   ·   Формат Telegram — ожидается   ·   Диалог — ожидается"), "muted"
         )
         body.addWidget(self.local_status)
-        self.consent = QCheckBox("Все затрагиваемые участники явно согласились на импорт в этот диалог")
-        self.consent.setAccessibleName("Согласие участников на импорт выбранного пакета в выбранный диалог")
+        self.consent = QCheckBox(tr("Все затрагиваемые участники явно согласились на импорт в этот диалог"))
+        self.consent.setAccessibleName(tr("Согласие участников на импорт выбранного пакета в выбранный диалог"))
         self.consent.toggled.connect(self.consent_changed)
         body.addWidget(self.consent)
-        self.preflight_button = _button("Проверить формат и диалог", self.preflight, True)
-        self.start_button = _button("Подтвердить и импортировать…", self.confirm, True)
-        self.cancel_button = _button("Остановить", self.cancel)
+        self.preflight_button = _button(tr("Проверить формат и диалог"), self.preflight, True)
+        self.start_button = _button(tr("Подтвердить и импортировать…"), self.confirm, True)
+        self.cancel_button = _button(tr("Остановить"), self.cancel)
         body.addLayout(_row(self.preflight_button, self.start_button, self.cancel_button))
-        body.addWidget(label("Проверка формата передаёт Telegram до 100 первых строк пакета.", "muted"))
+        body.addWidget(label(tr("Проверка формата передаёт Telegram до 100 первых строк пакета."), "muted"))
         layout.addWidget(box)
         authors, group = panel()
-        group.addWidget(label("Авторство для верификации", "section"))
+        group.addWidget(label(tr("Авторство для верификации"), "section"))
         self.self_author, self.peer_author = QComboBox(), QComboBox()
-        group.addLayout(_row(label("Мой аккаунт"), self.self_author, label("Собеседник"), self.peer_author))
-        group.addWidget(label("Карта используется при сравнении двух снимков после импорта.", "muted"))
+        group.addLayout(_row(label(tr("Мой аккаунт")), self.self_author, label(tr("Собеседник")), self.peer_author))
+        group.addWidget(label(tr("Карта используется при сравнении двух снимков после импорта."), "muted"))
         box, group = panel()
-        self.state = label("Ожидание пакета и аккаунта.", "section")
+        self.state = label(tr("Ожидание пакета и аккаунта."), "section")
         self.counts = label("", "secondary")
         self.details = label("", "muted")
         self.details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -342,17 +345,18 @@ class TelegramControls(QObject):
         group.addWidget(self.details)
         self.recovery_panel = self.make_recovery_panel()
         group.addWidget(self.recovery_panel)
-        self.diagnostic_button = _button("Сохранить диагностический отчёт…", self.export_diagnostic)
-        group.addLayout(_row(self.diagnostic_button))
-        self.baseline_button = _button("Сохранить границу до импорта…", self.baseline)
-        self.observe_button = _button("Сохранить снимок…", self.observe)
-        self.historical_button = _button("Снимок по датам…", self.historical_observe)
-        self.probe_media = QCheckBox("Проверить чтение первых 4 КиБ медиа")
+        self.diagnostic_button = _button(tr("Сохранить диагностический отчёт…"), self.export_diagnostic)
+        self.repair_video_button = _button(tr("Выбрать обработку видео…"), self.repair_video)
+        group.addLayout(_row(self.diagnostic_button, self.repair_video_button))
+        self.baseline_button = _button(tr("Сохранить границу до импорта…"), self.baseline)
+        self.observe_button = _button(tr("Сохранить снимок…"), self.observe)
+        self.historical_button = _button(tr("Снимок по датам…"), self.historical_observe)
+        self.probe_media = QCheckBox(tr("Проверить чтение первых 4 КиБ медиа"))
         group.addLayout(_row(self.baseline_button, self.observe_button, self.historical_button))
         group.addWidget(self.probe_media)
         group.addWidget(
             label(
-                "Сохраните границу до импорта на каждом аккаунте. После запуска снимите историю отдельно с обоих аккаунтов и проверьте её в клиентах после перезапуска.",
+                tr("Сохраните границу до импорта на каждом аккаунте. После запуска снимите историю отдельно с обоих аккаунтов и проверьте её в клиентах после перезапуска."),
                 "muted",
             )
         )
@@ -366,14 +370,14 @@ class TelegramControls(QObject):
 
     def make_recovery_panel(self):
         box, layout = panel()
-        layout.addWidget(label("Предыдущие операции импорта", "section"))
+        layout.addWidget(label(tr("Предыдущие операции импорта"), "section"))
         summary = label("", "secondary")
         summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(summary)
-        review_button = _button("Проверить предыдущую операцию", self.review_previous)
-        matches_button = _button("Просмотреть совпадения", self.show_recovery_matches)
-        new_button = _button("Импортировать только новые записи", self.prepare_new_records, True)
-        cancel = _button("Отмена", self.dismiss_recovery)
+        review_button = _button(tr("Проверить предыдущую операцию"), self.review_previous)
+        matches_button = _button(tr("Просмотреть совпадения"), self.show_recovery_matches)
+        new_button = _button(tr("Импортировать только новые записи"), self.prepare_new_records, True)
+        cancel = _button(tr("Отмена"), self.dismiss_recovery)
         layout.addLayout(_row(review_button, matches_button))
         layout.addLayout(_row(new_button, cancel))
         hint = label("", "muted")
@@ -394,14 +398,14 @@ class TelegramControls(QObject):
             cancel.setEnabled(ready)
             if self._can_prepare_eligible():
                 hint.setText(
-                    "Для новых записей будет создан отдельный пакет. Отправка потребует нового согласия."
+                    tr("Для новых записей будет создан отдельный пакет. Отправка потребует нового согласия.")
                 )
             elif review.eligible_count:
                 hint.setText(
-                    "Для подготовки новых записей нужен исходный проект и пакет, подготовленный в Beta или позднее."
+                    tr("Для подготовки новых записей нужен исходный проект и пакет, подготовленный в Beta или позднее.")
                 )
             else:
-                hint.setText("Для этого пакета сейчас нет записей, которые можно безопасно отправить.")
+                hint.setText(tr("Для этого пакета сейчас нет записей, которые можно безопасно отправить."))
 
         self.updated.connect(update)
         update()
@@ -410,19 +414,17 @@ class TelegramControls(QObject):
     @staticmethod
     def recovery_summary(review):
         lines = [
-            f"{item.operation_id} · {PHASE_NAMES.get(item.phase, 'Требуется проверка')}"
+            f"{item.operation_id} · {tr(PHASE_NAMES.get(item.phase, 'Требуется проверка'))}"
             + (
-                f" · пересечение {number(item.overlap)}"
+                tr(' · пересечение {0}').format(number(item.overlap))
                 if item.overlap is not None
-                else " · объём неизвестен"
+                else tr(" · объём неизвестен")
             )
             for item in review.conflicts
         ]
-        overlap = number(review.overlap) if review.overlap is not None else "не установлено"
+        overlap = number(review.overlap) if review.overlap is not None else tr("не установлено")
         lines.append(
-            f"Выбрано {number(review.selected)} · Совпадения: {overlap}\n"
-            f"Подтверждено {number(review.confirmed)} · Можно добавить {number(review.eligible_count)} · "
-            f"Требуют проверки {number(review.unknown)}"
+            tr('Выбрано {0} · Совпадения: {1}\nПодтверждено {2} · Можно добавить {3} · Требуют проверки {4}').format(number(review.selected), overlap, number(review.confirmed), number(review.eligible_count), number(review.unknown))
         )
         return "\n".join(lines)
 
@@ -474,11 +476,11 @@ class TelegramControls(QObject):
             journal = journal_for(account, target)
             choices = [
                 f"{i}. {(journal.operation(item.operation_id) or {}).get('created', '')} · "
-                f"{PHASE_NAMES.get(item.phase, 'Требуется проверка')}"
+                f"{tr(PHASE_NAMES.get(item.phase, 'Требуется проверка'))}"
                 for i, item in enumerate(candidates, 1)
             ]
             chosen, ok = QInputDialog.getItem(
-                self.window, "Предыдущие операции", "Выберите дату и состояние", choices, 0, False
+                self.window, tr("Предыдущие операции"), tr("Выберите дату и состояние"), choices, 0, False
             )
             if not ok:
                 return
@@ -487,23 +489,23 @@ class TelegramControls(QObject):
             if (
                 QMessageBox.question(
                     self.window,
-                    "Завершение прежней подготовки",
-                    "Журнал подтверждает, что финальный запрос не отправлялся. Закрыть прежнюю подготовку? "
-                    "Новый импорт потребуется подтвердить отдельно.",
+                    tr("Завершение прежней подготовки"),
+                    tr("Журнал подтверждает, что финальный запрос не отправлялся. Закрыть прежнюю подготовку? "
+                    "Новый импорт потребуется подтвердить отдельно."),
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
                 != QMessageBox.StandardButton.Yes
             ):
                 return
-            action = "Закрытие прежней подготовки"
+            action = tr("Закрытие прежней подготовки")
             path = None
         elif not prior.can_attach:
-            action, path = "Открытие сохранённой операции", None
+            action, path = tr("Открытие сохранённой операции"), None
         else:
-            action = "Уточнение выборки" if prior.can_attach else "Проверка предыдущего пакета"
+            action = tr("Уточнение выборки") if prior.can_attach else tr("Проверка предыдущего пакета")
             path = QFileDialog.getExistingDirectory(
-                self.window, "Откройте папку пакета предыдущей операции", str(bundle.root.parent)
+                self.window, tr("Откройте папку пакета предыдущей операции"), str(bundle.root.parent)
             )
             if not path:
                 return
@@ -522,14 +524,14 @@ class TelegramControls(QObject):
                     operation = journal.operation(prior.operation_id)
                     if not operation or previous.manifest_hash() != operation["manifest_sha256"]:
                         raise RecoveryError(
-                            "Этот пакет не совпадает с ранее проверенным пакетом выбранной операции."
+                            tr("Этот пакет не совпадает с ранее проверенным пакетом выбранной операции.")
                         )
                     if not prior.can_attach:
                         return previous, None
                     journal.attach_selection(prior.operation_id, previous)
                 return None, journal.review_bundle(bundle)
             except sqlite3.Error:
-                raise RecoveryError("Не удалось проверить локальный журнал операций.") from None
+                raise RecoveryError(tr("Не удалось проверить локальный журнал операций.")) from None
 
         def ready(value):
             previous, updated = value
@@ -539,10 +541,10 @@ class TelegramControls(QObject):
             self.consent.setChecked(False)
             if self.recovery is None:
                 self.blocked = False
-                self.state.setText("Локальная проверка пройдена. Проверьте текущий пакет и диалог.")
-                self.local_status.setText("Доступна повторная проверка пакета.")
+                self.state.setText(tr("Локальная проверка пройдена. Проверьте текущий пакет и диалог."))
+                self.local_status.setText(tr("Доступна повторная проверка пакета."))
             else:
-                self.state.setText("Сведения о предыдущих операциях обновлены.")
+                self.state.setText(tr("Сведения о предыдущих операциях обновлены."))
             self.count()
             self.refresh()
             return self.state.text()
@@ -566,22 +568,79 @@ class TelegramControls(QObject):
         if self.busy or self.closing or self.window.worker or not self._can_prepare_eligible():
             return
         parent = QFileDialog.getExistingDirectory(
-            self.window, "Куда сохранить пакет новых записей", str(bundle.root.parent)
+            self.window, tr("Куда сохранить пакет новых записей"), str(bundle.root.parent)
         )
         if not parent:
             return
         dest = Path(parent) / f"gTR-new-{uuid4().hex[:10]}"
+        tools = self.window.video_tools()
+        policy = self.window.effective_video_policy(bundle.data.get("video_policy"))
 
-        def job(progress):
+        def job(progress, **media):
             try:
                 current = journal_for(account, target).review_bundle(bundle)
             except sqlite3.Error:
-                raise RecoveryError("Не удалось проверить локальный журнал операций.") from None
+                raise RecoveryError(tr("Не удалось проверить локальный журнал операций.")) from None
             if current.eligible != review.eligible:
-                raise RecoveryError("Состояние прошлых операций изменилось. Проверьте пакет заново.")
-            return prepare_eligible(project, bundle, dest, review.eligible, progress)
+                raise RecoveryError(tr("Состояние прошлых операций изменилось. Проверьте пакет заново."))
+            return prepare_eligible(project, bundle, dest, review.eligible, progress,
+                                    media_tools=tools, video_policy=policy, **media)
 
-        self.window.run_recovery_job("Подготовка новых записей", job, self.window.use_recovery_bundle)
+        self.window.run_recovery_media_job(
+            tr("Подготовка новых записей"), job, self.window.use_recovery_bundle, project=project,
+        )
+
+    def repair_video(self):
+        bundle, project = self.package, self.project
+        if self.busy or self.closing or self.window.worker or not (bundle and project and self.failed_video):
+            return
+        attempt = self.failed_video
+        entry = next((row for row in bundle.data["records"] if row.get("source_ordinal") == attempt.get("source_ordinal")), None)
+        if not entry:
+            self.info(tr("Откройте исходный проект и подготовьте пакет заново."))
+            return
+        video = entry.get("video_recovery", {})
+        original = next((asset for asset in entry.get("original_media", [])
+                         if asset["kind"] in {"video", "round_video"} and asset.get("sha256")), None)
+        if not original:
+            self.info(tr("Откройте исходный проект и подготовьте пакет заново."))
+            return
+        tools = self.window.video_tools()
+        key = video.get("key") or video_decision_key(
+            bundle.data["source_sha256"], bundle.data["chat_id"], entry["source_ordinal"], original["sha256"],
+        )
+        repeat_safe = video.get("action") != "convert" or video.get("method") == "remux"
+        options = ("compatible", "document") if repeat_safe and tools.ffmpeg and tools.ffprobe else ("document",)
+        dialog = CompatibilityDialog(self.window, [{
+            "key": key, "group": "server_document", "name": original["original"],
+            "date": entry.get("original_date"), "size": original.get("size"), "source": original.get("path"),
+            "sha256": original["sha256"], "original": video.get("original") or {},
+            "options": options, "recommended": options[0],
+            "reason": "server_document" if repeat_safe else "server_document_copy",
+        }], project, tools)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        decisions = dialog.decisions() if accepted else None
+        dialog.deleteLater()
+        if decisions is None or self.package is not bundle:
+            return
+        dest = bundle.root.parent / f"gTR-media-fix-{uuid4().hex[:10]}"
+        ranges = bundle.record_intervals()
+        profile, test_reset_id = self.bound_profile, self.test_reset_id
+        account, target = self.account, self.target.currentData()
+
+        def job(progress, **media):
+            return prepare_eligible(project, bundle, dest, ranges, progress, media_tools=tools, **media)
+
+        def ready(value):
+            message = self.window.use_recovery_bundle(value)
+            if self.account == account and self.target.currentData() == target:
+                self.bound_profile, self.test_reset_id = profile, test_reset_id
+            self.refresh()
+            return message
+
+        self.window.run_recovery_media_job(
+            tr("Подготовка нового пакета после ответа Telegram"), job, ready, project=project, decisions=decisions,
+        )
 
     def refresh(self):
         enabled = not self.busy and not self.closing and self.window.worker is None
@@ -609,7 +668,9 @@ class TelegramControls(QObject):
         self.observe_button.setEnabled(observable)
         self.historical_button.setEnabled(observable)
         self.diagnostic_button.setEnabled(bool(enabled and self.operation_id))
-        name = self.account.name if connected else "Аккаунт отключён."
+        self.repair_video_button.setVisible(bool(self.failed_video and self.package and self.project))
+        self.repair_video_button.setEnabled(bool(ready and self.failed_video))
+        name = self.account.name if connected else tr("Аккаунт отключён.")
         self.account_line.setText(name)
         if not connected:
             self.avatar.clear()
@@ -627,7 +688,7 @@ class TelegramControls(QObject):
             return
         self.busy = True
         self.refresh()
-        self.log(f"Telegram · {ACTION[name]}")
+        self.log(f"Telegram · {tr(ACTION[name])}")
         if self.thread is None:
             self.pending = name, operation
             self.thread = self.thread_factory(self)
@@ -769,6 +830,7 @@ class TelegramControls(QObject):
         self.transcript_uploaded = self.start_sent = self.start_accepted = False
         self.observed = self.verified = None
         self.operation_id = None
+        self.failed_video = None
 
     def set_package(self, bundle=None, project=None, source_path=""):
         self.bound_profile = None
@@ -780,10 +842,10 @@ class TelegramControls(QObject):
             self.source.setText(source_path or str(bundle.root))
             times = [r["original_date"] for r in data["records"] if r["included"] and r.get("original_date")]
             date_range = f" · {times[0][:10]} — {times[-1][:10]}" if times else ""
-            dates = "Исходное время" if data.get("date_policy") == "historical" else "Альтернативный план дат"
+            dates = tr("Исходное время") if data.get("date_policy") == "historical" else tr("Альтернативный план дат")
             self.plan.setText(f"{data.get('chat_title') or 'Диалог'} · {dates}{date_range}")
         else:
-            self.source.setText("Подготовьте или откройте пакет на соседней вкладке.")
+            self.source.setText(tr("Подготовьте или откройте пакет на соседней вкладке."))
             self.plan.clear()
         self.select_target()
         self.count()
@@ -794,17 +856,17 @@ class TelegramControls(QObject):
         self.reset_counters()
         self.details.clear()
         self.local_status.setText(
-            "Пакет — ожидается   ·   Формат Telegram — ожидается   ·   Диалог — ожидается"
+            tr("Пакет — ожидается   ·   Формат Telegram — ожидается   ·   Диалог — ожидается")
         )
         if not self.busy:
             if not self.package:
-                self.state.setText("Подготовьте или откройте пакет.")
+                self.state.setText(tr("Подготовьте или откройте пакет."))
             elif not self.account:
-                self.state.setText("Пакет открыт. Подключите Telegram.")
+                self.state.setText(tr("Пакет открыт. Подключите Telegram."))
             elif not self.target.currentData():
-                self.state.setText("Выберите целевой диалог.")
+                self.state.setText(tr("Выберите целевой диалог."))
             else:
-                self.state.setText("Проверьте формат и диалог.")
+                self.state.setText(tr("Проверьте формат и диалог."))
         self._participant_choices()
         self.count()
         self.refresh()
@@ -822,7 +884,7 @@ class TelegramControls(QObject):
         )
         for menu, peer in pairs:
             menu.clear()
-            menu.addItem("Выберите имя", "")
+            menu.addItem(tr("Выберите имя"), "")
             for name, ids in identities.items():
                 menu.addItem(name, name)
                 if ids == {f"user{peer}"}:
@@ -837,7 +899,7 @@ class TelegramControls(QObject):
 
     def preflight(self):
         if not self._test_mode_selected():
-            self.info("Включите тестовый режим в выбранном профиле и подготовьте пакет заново.")
+            self.info(tr("Включите тестовый режим в выбранном профиле и подготовьте пакет заново."))
             return
         if self.bound_profile:
             from .journal import Endpoint
@@ -849,7 +911,7 @@ class TelegramControls(QObject):
                 or self.bound_profile
                 != (self.account.id, Endpoint.telegram(self.account.id, target.id, target.kind).key)
             ):
-                self.info("Подключите аккаунт и выберите целевой диалог сохранённого профиля.")
+                self.info(tr("Подключите аккаунт и выберите целевой диалог сохранённого профиля."))
                 return
         if not self.package or not self.target.currentData() or not self.consent.isChecked() or self.busy:
             return
@@ -872,23 +934,21 @@ class TelegramControls(QObject):
         if review is None or self.busy or not self.consent.isChecked():
             return
         if review.test_reset_id != self.test_reset_id or not self._test_mode_selected():
-            self.info("Режим импорта изменился. Повторите проверку пакета.")
+            self.info(tr("Режим импорта изменился. Повторите проверку пакета."))
             return
         check = review.check
         dialog = QMessageBox(self.window)
         dialog.setTextFormat(Qt.TextFormat.PlainText)
         dialog.setWindowTitle(
-            "Подтверждение тестового импорта" if self.test_reset_id is not None else "Подтверждение владельца"
+            tr("Подтверждение тестового импорта") if self.test_reset_id is not None else tr("Подтверждение владельца")
         )
         dialog.setText(
-            f"Аккаунт {review.account.name} · ID {review.account.id}\n"
-            f"Диалог {review.target.title} · ID {review.target.id}\n\n"
-            f"Сообщения {number(check.messages)} · Медиа {number(check.media)}"
+            tr('Аккаунт {0} · ID {1}\nДиалог {2} · ID {3}\n\nСообщения {4} · Медиа {5}').format(review.account.name, review.account.id, review.target.title, review.target.id, number(check.messages), number(check.media))
         )
         dialog.setInformativeText(
-            "Пакет добавит записи в общий чат. Проверьте цель и сообщение Telegram.\n\n" + check.confirmation
+            tr("Пакет добавит записи в общий чат. Проверьте цель и сообщение Telegram.\n\n") + check.confirmation
         )
-        start = dialog.addButton("Начать импорт", QMessageBox.ButtonRole.AcceptRole)
+        start = dialog.addButton(tr("Начать импорт"), QMessageBox.ButtonRole.AcceptRole)
         dialog.addButton(QMessageBox.StandardButton.Cancel)
         dialog.setDefaultButton(QMessageBox.StandardButton.Cancel)
         dialog.exec()
@@ -962,7 +1022,7 @@ class TelegramControls(QObject):
     def baseline(self):
         target = self.target.currentData()
         if self.package and target:
-            path = self._snapshot_path("Сохранить границу до импорта")
+            path = self._snapshot_path(tr("Сохранить границу до импорта"))
             if path:
                 root, protected = self.package.root, self._protected()
                 self.dispatch(
@@ -983,32 +1043,32 @@ class TelegramControls(QObject):
         target = self.target.currentData()
         if not self.package or not target:
             return
-        methods = ("Файл границы до импорта", "Ввести ID вручную")
+        methods = (tr("Файл границы до импорта"), tr("Ввести ID вручную"))
         method, ok = QInputDialog.getItem(
-            self.window, "Диапазон истории", "Нижняя граница для этого аккаунта", methods, 0, False
+            self.window, tr("Диапазон истории"), tr("Нижняя граница для этого аккаунта"), methods, 0, False
         )
         if not ok:
             return
         baseline, after = None, 0
         if method == methods[0]:
             file, _ = QFileDialog.getOpenFileName(
-                self.window, "Граница этого аккаунта", "", "Снимки (*.json)"
+                self.window, tr("Граница этого аккаунта"), "", tr("Снимки (*.json)")
             )
             if not file:
                 return
             baseline = Path(file)
         else:
             after, ok = QInputDialog.getInt(
-                self.window, "Диапазон истории", "Последний ID до импорта", 0, 0, 2**31 - 2
+                self.window, tr("Диапазон истории"), tr("Последний ID до импорта"), 0, 0, 2**31 - 2
             )
             if not ok:
                 return
         through, ok = QInputDialog.getInt(
-            self.window, "Диапазон истории", "Последний ID в диапазоне (0 — до конца)", 0, 0, 2**31 - 2
+            self.window, tr("Диапазон истории"), tr("Последний ID в диапазоне (0 — до конца)"), 0, 0, 2**31 - 2
         )
         if not ok:
             return
-        if path := self._snapshot_path("Сохранить снимок"):
+        if path := self._snapshot_path(tr("Сохранить снимок")):
             window = CaptureWindow(
                 path,
                 after,
@@ -1025,24 +1085,24 @@ class TelegramControls(QObject):
         if not self.package or not target:
             return
         first, ok = QInputDialog.getText(
-            self.window, "Ограниченный поиск", "Начальная историческая дата UTC (ГГГГ-ММ-ДД)"
+            self.window, tr("Ограниченный поиск"), tr("Начальная историческая дата UTC (ГГГГ-ММ-ДД)")
         )
         if not ok:
             return
         last, ok = QInputDialog.getText(
-            self.window, "Ограниченный поиск", "Конечная историческая дата UTC (ГГГГ-ММ-ДД)"
+            self.window, tr("Ограниченный поиск"), tr("Конечная историческая дата UTC (ГГГГ-ММ-ДД)")
         )
         if not ok:
             return
         limit, ok = QInputDialog.getInt(
             self.window,
-            "Ограниченный поиск",
-            "Сколько последних записей просмотреть на наличие отметки импорта",
+            tr("Ограниченный поиск"),
+            tr("Сколько последних записей просмотреть на наличие отметки импорта"),
             500,
             1,
             20000,
         )
-        if ok and (path := self._snapshot_path("Сохранить снимок по датам")):
+        if ok and (path := self._snapshot_path(tr("Сохранить снимок по датам"))):
             window = CaptureWindow(
                 path,
                 0,
@@ -1074,43 +1134,39 @@ class TelegramControls(QObject):
         observed = "—" if self.observed is None else number(self.observed)
         verified = "—" if self.verified is None else number(self.verified)
         start = (
-            "Принят Telegram"
+            tr("Принят Telegram")
             if self.start_accepted
-            else "Отправка или ожидание ответа"
+            else tr("Отправка или ожидание ответа")
             if self.start_sent
-            else "Не начат"
+            else tr("Не начат")
         )
         text_status = (
-            "не отправлялся · локальная блокировка"
+            tr("не отправлялся · локальная блокировка")
             if self.blocked
-            else "принят"
+            else tr("принят")
             if self.transcript_uploaded
-            else "отправка начата, приём не подтверждён"
+            else tr("отправка начата, приём не подтверждён")
             if self.transcript_sent
-            else "не отправлялся"
+            else tr("не отправлялся")
         )
         self.counts.setText(
-            f"Найдено {number(source)} · Выбрано {number(data.get('selected_records', data['included']))} · Проверено записей {number(self.validated)}\n"
-            f"В пакете {number(data['included'])} · Пропущено {number(data['skipped'])}\n"
-            f"Текст истории {text_status} · Медиа принято {number(self.uploaded)} из {number(len(data['media']))}\n"
-            f"Запуск: {start} · Записей в снимке {observed} · Сверено в двух клиентах {verified} · Ошибки {self.errors}"
+            tr('Найдено {0} · Выбрано {1} · Проверено записей {2}\nВ пакете {3} · Пропущено {4}\nТекст истории {5} · Медиа принято {6} из {7}\nЗапуск: {8} · Записей в снимке {9} · Сверено в двух клиентах {10} · Ошибки {11}').format(number(source), number(data.get('selected_records', data['included'])), number(self.validated), number(data['included']), number(data['skipped']), text_status, number(self.uploaded), number(len(data['media'])), start, observed, verified, self.errors)
         )
         self.updated.emit()
 
     def file_transfer(self, detail):
         sent, size = detail["sent"], detail["size"]
         self.state.setText(
-            f"Передача вложения {detail['index']} из {detail['total']} · {detail['name']}\n"
-            f"{size_text(sent)} из {size_text(size)} · {sent * 100 // max(1, size)} % · {size_text(detail['speed'])}/с"
+            tr('Передача вложения {0} из {1} · {2}\n{3} из {4} · {5} % · {6}/с').format(detail['index'], detail['total'], detail['name'], size_text(sent), size_text(size), sent * 100 // max(1, size), size_text(detail['speed']))
         )
         self.updated.emit()
 
     def progress(self, stage, done, total):
-        self.state.setText(STAGES.get(stage, "Подготовка данных"))
+        self.state.setText(tr(STAGES.get(stage, "Подготовка данных")))
         if stage == "check_history":
-            self.local_status.setText("Пакет проверен   ·   Распознавание формата Telegram")
+            self.local_status.setText(tr("Пакет проверен   ·   Распознавание формата Telegram"))
         elif stage == "check_peer":
-            self.local_status.setText("Пакет проверен   ·   Формат распознан   ·   Проверка диалога")
+            self.local_status.setText(tr("Пакет проверен   ·   Формат распознан   ·   Проверка диалога"))
         if stage in {"verify", "copy"}:
             self.checked = max(self.checked, done)
         if stage == "validated":
@@ -1120,7 +1176,7 @@ class TelegramControls(QObject):
         elif stage == "transcript_uploaded":
             self.transcript_uploaded = True
         elif stage == "upload_item":
-            self.state.setText(f"Отправляется вложение {number(done)} из {number(total)}")
+            self.state.setText(tr('Отправляется вложение {0} из {1}').format(number(done), number(total)))
         elif stage == "upload":
             self.uploaded = done
         elif stage == "start_pending":
@@ -1138,13 +1194,13 @@ class TelegramControls(QObject):
         elif name in {"test_connect", "test_code", "test_password"}:
             self._test_login(result)
         elif name == "test_cancel":
-            self.window.profiles_page.test_status.setText("Проверка остановлена.")
+            self.window.profiles_page.test_status.setText(tr("Проверка остановлена."))
         elif name == "disconnect":
             self.account = self.review = None
             self.target.clear()
             self.dialog_preview.clear()
-            self.dialog_summary.setText("Подключите аккаунт для просмотра диалогов.")
-            self.state.setText("Аккаунт отключён.")
+            self.dialog_summary.setText(tr("Подключите аккаунт для просмотра диалогов."))
+            self.state.setText(tr("Аккаунт отключён."))
         elif name == "remember":
             self.use_saved.setEnabled(vault_path().is_file())
             self.use_saved_api.setChecked(api_vault_path().is_file())
@@ -1156,12 +1212,12 @@ class TelegramControls(QObject):
         elif name == "dialogs":
             self.target.clear()
             self.dialog_preview.clear()
-            self.target.addItem("Выберите целевой диалог", None)
+            self.target.addItem(tr("Выберите целевой диалог"), None)
             for target in result:
                 title = target.title
                 self.target.addItem(title, target)
                 self.dialog_preview.addItem(title, target)
-            self.dialog_summary.setText(f"Доступных для проверки диалогов {number(len(result))}.")
+            self.dialog_summary.setText(tr('Доступных для проверки диалогов {0}.').format(number(len(result))))
         elif name == "preflight":
             target = self.target.currentData()
             if result.test_reset_id != self.test_reset_id or not self._test_mode_selected():
@@ -1172,26 +1228,25 @@ class TelegramControls(QObject):
             self.review = result
             self.operation_id = result.check.operation_id
             limit = result.check.max_upload_bytes
-            self.local_status.setText("Пакет проверен   ·   Формат распознан   ·   Диалог разрешён")
+            self.local_status.setText(tr("Пакет проверен   ·   Формат распознан   ·   Диалог разрешён"))
             self.details.setText(
-                f"Операция {result.check.operation_id} · "
-                + (f"предел файла {size_text(limit)}" if limit else "лимит файла в ответе отсутствует")
+                tr('Операция {0} · ').format(result.check.operation_id)
+                + (tr('предел файла {0}').format(size_text(limit)) if limit else tr("лимит файла в ответе отсутствует"))
             )
         elif name == "import":
             self.operation_id = result["operation_id"]
             self.start_sent = self.start_accepted = True
             self.details.setText(
-                f"Операция {result['operation_id']}. Telegram принял запуск. "
-                "Для результата прочитайте историю отдельно с обоих аккаунтов."
+                tr('Операция {0}. Telegram принял запуск. Для результата прочитайте историю отдельно с обоих аккаунтов.').format(result['operation_id'])
             )
         elif name == "baseline":
-            self.info(f"Граница сохранена. Последний ID сообщения {result['last_id']}.")
+            self.info(tr('Граница сохранена. Последний ID сообщения {0}.').format(result['last_id']))
         elif name == "observe":
             self.observed = result["messages"]
-            self.details.setText(f"Снимок сохранён · {number(result['messages'])} записей\n{result['path']}")
+            self.details.setText(tr('Снимок сохранён · {0} записей\n{1}').format(number(result['messages']), result['path']))
         self.count()
         self.refresh()
-        self.log(f"Telegram · {ACTION[name]} · результат получен")
+        self.log(tr('Telegram · {0} · результат получен').format(tr(ACTION[name])))
 
     def _login(self, result):
         if result.challenge:
@@ -1224,11 +1279,12 @@ class TelegramControls(QObject):
         if self.closing:
             return
         if name == "profile":
-            self.log("Telegram · Не удалось прочитать карточку аккаунта")
+            self.log(tr("Telegram · Не удалось прочитать карточку аккаунта"))
             self.refresh()
             return
         if name in {"import", "preflight"}:
             self.review = None
+            self.failed_video = None
         if name == "disconnect":
             self.account = self.review = None
             self.target.clear()
@@ -1236,34 +1292,42 @@ class TelegramControls(QObject):
         if isinstance(error, RecoveryRequired):
             self.blocked = True
             self.recovery = error.review
-            self.state.setText("Обнаружена предыдущая операция импорта.")
+            self.state.setText(tr("Обнаружена предыдущая операция импорта."))
             self.local_status.setText(
-                "Локальная проверка остановила попытку до обращения к Telegram."
+                tr("Локальная проверка остановила попытку до обращения к Telegram.")
                 if name == "preflight"
-                else "Локальная проверка остановила запуск до отправки пакета."
+                else tr("Локальная проверка остановила запуск до отправки пакета.")
             )
             self.details.setText(self.local_status.text())
-            self.log("Локальная проверка выявила предыдущую операцию.")
+            self.log(tr("Локальная проверка выявила предыдущую операцию."))
         elif isinstance(error, ImportFault):
             self.errors += 1
             self.operation_id = getattr(error, "operation_id", None) or self.operation_id
             details = error.details()
-            self.state.setText(f"{details['status_code']} · {error!s}")
+            state = tr(error.policy.message, fallback=tr("Ошибка"))
+            if error.seconds:
+                state += " " + tr("Ожидание {seconds} с.").format(seconds=error.seconds)
+            action = tr(details["action"], fallback=tr("Проверьте этап и состояние операции в журнале."))
+            self.state.setText(f"{details['status_code']} · {state}")
             item = getattr(error, "media_attempt", None)
             if item:
-                self.state.setText(f"Ошибка на вложении {item['index']} из {item['total']} · {error.code}")
+                if error.code == "MEDIA_TYPE_CHANGED" and item.get("source_ordinal") is not None:
+                    self.failed_video = item
+                self.state.setText(tr('Ошибка на вложении {0} из {1} · {2}').format(item['index'], item['total'], error.code))
                 self.details.setText(
-                    f"{item['name']} · Запись №{item['source_ordinal']} · ID сообщения {item['source_id'] or '—'}\n"
-                    f"Класс {item['input_media']} · MIME определён {item['detected_mime'] or '—'}, объявлен {item['declared_mime'] or '—'} · {number(item['size'])} байт\n"
-                    f"{details['action']} Сохраните отчёт и изучите исходный файл перед подготовкой отдельного пакета."
+                    tr(
+                        "{0} · Запись №{1} · ID сообщения {2}\nКласс {3} · MIME определён {4}, объявлен {5} · "
+                        "{6} байт\n{7} Сохраните отчёт и изучите исходный файл перед подготовкой отдельного пакета."
+                    ).format(item["name"], item["source_ordinal"], item["source_id"] or "—", item["input_media"],
+                             item["detected_mime"] or "—", item["declared_mime"] or "—", number(item["size"]), action)
                 )
             else:
-                self.details.setText(f"{STAGES.get(details['stage'], ACTION[name])} · {details['action']}")
-            self.log(f"Telegram · {ACTION[name]} · {error.code}")
+                self.details.setText(f"{tr(STAGES.get(details['stage'], ACTION[name]))} · {action}")
+            self.log(f"Telegram · {tr(ACTION[name])} · {error.code}")
         else:
             self.errors += int(not isinstance(error, Cancelled))
-            self.state.setText(str(error))
-            self.log(f"Telegram · {ACTION[name]} · остановлено")
+            self.state.setText(tr(str(error), fallback=tr("Подробности доступны в диагностическом отчёте.")))
+            self.log(tr('Telegram · {0} · остановлено').format(tr(ACTION[name])))
         if name in {"connect", "code", "password", "remember", "dialogs", "disconnect"}:
             self.info(str(error))
         if name.startswith("test_"):

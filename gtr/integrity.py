@@ -154,7 +154,7 @@ def check_local(bundle, project: Path | None, progress=quiet) -> dict:
                     if mode != "text_only":
                         policy = bundle.data.get("video_policy")
                         decision = record.get("video_recovery")
-                        group_skip = decision and decision.get("scope") == "group" and policy == "skip"
+                        group_skip = decision and decision.get("scope") == "group" and decision.get("action") == "skip"
                         payload = plan_media(
                             [item for item in files if item["kind"] not in VIDEO_KINDS] if group_skip else files,
                             meta, asset_ordinal + 1, [], documents_only=mode == "document",

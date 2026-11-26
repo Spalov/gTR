@@ -9,8 +9,9 @@ from .backup import backup_project
 from .conversion import MEDIA_MODES, RECORD_KINDS, load_bundle, plan_import, prepare
 from .core import analyze, catalogue, summary, verify
 from .faults import ImportFault
-from .files import local, publish_text
+from .files import local, publish_text, read_json
 from .journal import Endpoint, Journal
+from .media_queue import MediaDecisionRequired
 from .mock_api import SCENARIOS, rehearse
 from .model import RecoveryError, quiet
 from .reports import plan_summary, redact_verification, save_report
@@ -69,8 +70,13 @@ def arguments():
         convert.add_argument("--record-kind", choices=RECORD_KINDS, default="all", help="Выбор типа исходной записи")
         convert.add_argument("--dates", choices=("historical", "ordered"), default="historical")
         convert.add_argument("--media-mode", choices=MEDIA_MODES, default="text_media", help="Режим вложений")
-        convert.add_argument("--video-policy", choices=VIDEO_POLICIES, default="original",
-                             help="Как подготовить видео. compatible разрешает перекодирование копии")
+        video = convert.add_mutually_exclusive_group()
+        video.add_argument("--video-policy", choices=VIDEO_POLICIES,
+                           help="Как подготовить видео. compatible разрешает перекодирование копии")
+        video.add_argument("--auto-compatible-videos", action="store_true",
+                           help="Разрешить создание совместимых копий для выбранного архива")
+        convert.add_argument("--video-decisions", type=Path,
+                             help="JSON с решениями по ключам из локального плана")
         convert.add_argument("--ffmpeg", type=Path)
         convert.add_argument("--ffprobe", type=Path)
         convert.add_argument("--historical-notes", action="store_true",
@@ -151,6 +157,25 @@ def arguments():
     return parser
 
 
+def conversion_options(args):
+    decisions = read_json(args.video_decisions) if args.video_decisions else None
+    if args.video_decisions and not isinstance(decisions, dict):
+        raise RecoveryError("Файл решений о медиа должен содержать объект JSON.")
+    return {
+        "profile": args.profile,
+        "sample": args.sample,
+        "date_policy": args.dates,
+        "media_mode": args.media_mode,
+        "first_record": args.first_record,
+        "last_record": args.last_record,
+        "video_policy": args.video_policy or ("compatible" if args.auto_compatible_videos else "original"),
+        "video_decisions": decisions,
+        "media_tools": MediaTools(args.ffmpeg, args.ffprobe),
+        "annotate": args.historical_notes,
+        "record_kind": args.record_kind,
+    }
+
+
 def main(argv=None):
     args = arguments().parse_args(argv)
     try:
@@ -179,16 +204,7 @@ def main(argv=None):
                 args.chat,
                 args.out,
                 args.timezone,
-                profile=args.profile,
-                sample=args.sample,
-                date_policy=args.dates,
-                media_mode=args.media_mode,
-                first_record=args.first_record,
-                last_record=args.last_record,
-                video_policy=args.video_policy,
-                media_tools=MediaTools(args.ffmpeg, args.ffprobe),
-                annotate=args.historical_notes,
-                record_kind=args.record_kind,
+                **conversion_options(args),
             )
             result = {
                 k: bundle.data[k]
@@ -221,18 +237,11 @@ def main(argv=None):
                 args.project,
                 args.chat,
                 args.timezone,
-                profile=args.profile,
-                sample=args.sample,
-                date_policy=args.dates,
-                media_mode=args.media_mode,
-                first_record=args.first_record,
-                last_record=args.last_record,
-                video_policy=args.video_policy,
-                media_tools=MediaTools(args.ffmpeg, args.ffprobe),
-                annotate=args.historical_notes,
-                record_kind=args.record_kind,
+                **conversion_options(args),
             )
             result = plan_summary(data)
+            if pending := data.get("media_decisions_required"):
+                result["media_decisions_required"] = pending
             if args.out:
                 save_report(args.out, project=args.project, package=data, planned=True)
         elif args.command == "media-check":
@@ -358,6 +367,13 @@ def main(argv=None):
             )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+    except MediaDecisionRequired as pending:
+        print(json.dumps({
+            "status": "media_decision_required",
+            "message": str(pending),
+            "media_decisions_required": pending.entries,
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
     except ImportFault as fault:
         print(json.dumps(fault.details(), ensure_ascii=False), file=sys.stderr)
         return 2

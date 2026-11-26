@@ -44,6 +44,28 @@ def accepted(journal, bundle, project=None):
     return ticket.operation_id, api
 
 
+
+def test_regeneration_after_restart_keeps_media_preferences_and_record_filter(tmp_path):
+    source = write_json(tmp_path / "source-filtered", [
+        message(1, "История", forwarded_from="Архивная подпись", media_type="video_file", file="synthetic.mp4"),
+        message(2, "Вне выборки"),
+    ])
+    (source / "synthetic.mp4").write_bytes(b"\x00\x00\x00\x18ftypisom")
+    catalogue = analyze(source, tmp_path / "recovery-catalogue")
+    plan = prepare(catalogue, 1, tmp_path / "prepared-choices", "source",
+                   video_policy="document", annotate=True, record_kind="forward")
+    journal = journal_at(tmp_path)
+    job, _ = accepted(journal, plan, catalogue)
+    retained = recovery_root(journal, plan.manifest_hash())
+    assert retained.resolve().is_relative_to(tmp_path.resolve())
+    shutil.rmtree(retained)
+
+    restored = recover_package(journal_at(tmp_path), job)
+    assert restored.manifest_hash() == plan.manifest_hash()
+    assert restored.data["media"][0]["force_file"]
+    assert restored.data["included"] == 1
+    assert "Историческая пометка" in restored.transcript.read_text(encoding="utf-8")
+
 def test_updated_archive_recognizes_partial_overlap_after_restart(tmp_path):
     p = project(tmp_path, "first", [message(n, "Снова") for n in range(11, 15)])
     old = prepare(p, 1, tmp_path / "first")

@@ -26,6 +26,7 @@ from .conversion import load_bundle, prepare
 from .core import verify
 from .dashboard import label, number, panel
 from .fixtures import FIXTURE_SIZES, prepare_fixture
+from .i18n import tr
 from .integrity import check_local
 from .media_engine import MEDIA_ISSUES, inspect_bundle
 from .model import RecoveryError
@@ -71,7 +72,7 @@ class ImportWizard(QWidget):
         self.step = QProgressBar()
         self.step.setRange(1, len(STEPS))
         self.step.setTextVisible(False)
-        self.step.setAccessibleName("Шаг мастера импорта")
+        self.step.setAccessibleName(tr("Шаг мастера импорта"))
         layout.addWidget(self.title)
         layout.addWidget(self.step)
         self.pages = QStackedWidget()
@@ -96,8 +97,8 @@ class ImportWizard(QWidget):
         layout.addWidget(self.pages, 1)
         self.hint = label("", "muted")
         layout.addWidget(self.hint)
-        self.back = button("Назад", lambda: self.go(-1))
-        self.forward = button("Далее", lambda: self.go(1), primary=True)
+        self.back = button(tr("Назад"), lambda: self.go(-1))
+        self.forward = button(tr("Далее"), lambda: self.go(1), primary=True)
         navigation = QHBoxLayout()
         navigation.addWidget(self.back)
         navigation.addStretch()
@@ -111,30 +112,30 @@ class ImportWizard(QWidget):
         area.addWidget(self.source_label)
         area.addLayout(
             bar(
-                button("Открыть экспорт…", lambda: self.window.choose_archive(on_ready=self.project_ready)),
-                button("Открыть папку…", lambda: self.window.choose_folder(on_ready=self.project_ready)),
-                button("Открыть проект…", lambda: self.window.browse_project(on_ready=self.project_ready)),
+                button(tr("Открыть экспорт…"), lambda: self.window.choose_archive(on_ready=self.project_ready)),
+                button(tr("Открыть папку…"), lambda: self.window.choose_folder(on_ready=self.project_ready)),
+                button(tr("Открыть проект…"), lambda: self.window.browse_project(on_ready=self.project_ready)),
             )
         )
         area.addLayout(
             bar(
                 button(
-                    "Открыть готовый пакет…", lambda: self.window.select_bundle(on_ready=self.package_ready)
+                    tr("Открыть готовый пакет…"), lambda: self.window.select_bundle(on_ready=self.package_ready)
                 ),
-                button("Синтетические данные", lambda: self.choose_source("fixture")),
+                button(tr("Синтетические данные"), lambda: self.choose_source("fixture")),
             )
         )
-        self.use_project = button("Выбрать открытый проект", self.project_ready)
+        self.use_project = button(tr("Выбрать открытый проект"), self.project_ready)
         area.addWidget(self.use_project, alignment=Qt.AlignmentFlag.AlignLeft)
 
     def _history(self, area):
         self.history_label = label("", "secondary")
         area.addWidget(self.history_label)
-        self.history_button = button("Проверить сохранённую историю", self.check_history, primary=True)
+        self.history_button = button(tr("Проверить сохранённую историю"), self.check_history, primary=True)
         area.addWidget(self.history_button, alignment=Qt.AlignmentFlag.AlignLeft)
         area.addWidget(
             label(
-                "Сверяются страницы и JSON истории по SHA-256. Вложения проверяются отдельно, если они входят в пакет.",
+                tr("Сверяются страницы и JSON истории по SHA-256. Вложения проверяются отдельно, если они входят в пакет."),
                 "muted",
             )
         )
@@ -144,28 +145,28 @@ class ImportWizard(QWidget):
         area.addWidget(self.account)
         area.addLayout(
             bar(
-                button("Управление аккаунтом", self.telegram.go_to_account),
-                button("Загрузить диалоги", self.telegram.load_dialogs),
+                button(tr("Управление аккаунтом"), self.telegram.go_to_account),
+                button(tr("Загрузить диалоги"), self.telegram.load_dialogs),
             )
         )
         self.target = QComboBox()
-        self.target.setAccessibleName("Диалог для импорта")
+        self.target.setAccessibleName(tr("Диалог для импорта"))
         self.target.setModel(self.telegram.target.model())
-        self.target.setPlaceholderText("Выберите диалог Telegram")
+        self.target.setPlaceholderText(tr("Выберите диалог Telegram"))
         self.target.currentIndexChanged.connect(self.telegram.target.setCurrentIndex)
         area.addWidget(self.target)
-        area.addWidget(button("Продолжить импорт", self.window.show_import_profiles))
-        self.offline = QCheckBox("Продолжить подготовку без подключения")
+        area.addWidget(button(tr("Продолжить импорт"), self.window.show_import_profiles))
+        self.offline = QCheckBox(tr("Продолжить подготовку без подключения"))
         self.offline.toggled.connect(self.refresh)
         area.addWidget(self.offline)
 
     def _mode(self, area):
         self.mode = QComboBox()
-        self.mode.setAccessibleName("Режим импорта")
+        self.mode.setAccessibleName(tr("Режим импорта"))
         for title, code in (
-            ("Только текст", "text_only"),
-            ("Полная история", "text_media"),
-            ("Контрольный тест", "fixture"),
+            (tr("Только текст"), "text_only"),
+            (tr("Полная история"), "text_media"),
+            (tr("Контрольный тест"), "fixture"),
         ):
             self.mode.addItem(title, code)
         area.addWidget(self.mode)
@@ -173,30 +174,31 @@ class ImportWizard(QWidget):
         form = QFormLayout(self.window_options)
         self.chat = QComboBox()
         self.chat.setModel(self.window.import_chat.model())
-        self.chat.setAccessibleName("Диалог из локального архива")
+        self.chat.setAccessibleName(tr("Диалог из локального архива"))
         self.first, self.last = QSpinBox(), QSpinBox()
         self.first.setRange(1, 2**31 - 1)
         self.last.setRange(0, 2**31 - 1)
-        self.last.setSpecialValueText("До конца")
-        self.first.setAccessibleName("Первый исходный номер записи")
-        self.last.setAccessibleName("Последний исходный номер записи")
-        self.as_documents = QCheckBox("Передавать вложения как документы")
-        form.addRow("Диалог из архива", self.chat)
-        form.addRow("Первый номер записи", self.first)
-        form.addRow("Последний номер записи", self.last)
+        self.last.setSpecialValueText(tr("До конца"))
+        self.first.setAccessibleName(tr("Первый исходный номер записи"))
+        self.last.setAccessibleName(tr("Последний исходный номер записи"))
+        self.as_documents = QCheckBox(tr("Передавать вложения как документы"))
+        form.addRow(tr("Диалог из архива"), self.chat)
+        form.addRow(tr("Первый номер записи"), self.first)
+        form.addRow(tr("Последний номер записи"), self.last)
         form.addRow(self.as_documents)
         self.video = QComboBox()
         self.video.setModel(self.window.import_video.model())
         self.video.setCurrentIndex(self.window.import_video.currentIndex())
         self.video.currentIndexChanged.connect(self.window.import_video.setCurrentIndex)
         self.window.import_video.currentIndexChanged.connect(self.video.setCurrentIndex)
-        form.addRow("Видео", self.video)
+        form.addRow(tr("Видео"), self.video)
+        form.addRow(self.window.auto_video_checkbox())
         self.kind = QComboBox()
         self.kind.setModel(self.window.import_kind.model())
         self.kind.setCurrentIndex(self.window.import_kind.currentIndex())
         self.kind.currentIndexChanged.connect(self.window.import_kind.setCurrentIndex)
         self.window.import_kind.currentIndexChanged.connect(self.kind.setCurrentIndex)
-        form.addRow("Тип исходной записи", self.kind)
+        form.addRow(tr("Тип исходной записи"), self.kind)
         self.notes = self.window.notes_checkbox()
         self.notes.setChecked(self.window.import_notes.isChecked())
         self.notes.toggled.connect(self.window.import_notes.setChecked)
@@ -206,14 +208,14 @@ class ImportWizard(QWidget):
         self.test_options = QWidget()
         test_form = QFormLayout(self.test_options)
         self.test_size, self.test_type = QComboBox(), QComboBox()
-        self.test_size.setAccessibleName("Размер синтетического набора")
+        self.test_size.setAccessibleName(tr("Размер синтетического набора"))
         for size in FIXTURE_SIZES:
             self.test_size.addItem(str(size), size)
-        self.test_type.setAccessibleName("Состав синтетического набора")
-        self.test_type.addItem("Только синтетический текст", "text")
-        self.test_type.addItem("Текст и синтетическое изображение", "media")
-        test_form.addRow("Синтетических записей", self.test_size)
-        test_form.addRow("Состав", self.test_type)
+        self.test_type.setAccessibleName(tr("Состав синтетического набора"))
+        self.test_type.addItem(tr("Только синтетический текст"), "text")
+        self.test_type.addItem(tr("Текст и синтетическое изображение"), "media")
+        test_form.addRow(tr("Синтетических записей"), self.test_size)
+        test_form.addRow(tr("Состав"), self.test_type)
         area.addWidget(self.test_options)
         self.mode_label = label("", "muted")
         area.addWidget(self.mode_label)
@@ -234,26 +236,26 @@ class ImportWizard(QWidget):
     def _media(self, area):
         self.media_label = label("", "secondary")
         area.addWidget(self.media_label)
-        self.build_button = button("Проверить и подготовить пакет…", self.build_package, primary=True)
-        self.inventory_button = button("Сохранить диагностику медиа…", self.save_inventory)
-        self.open_report = button("Открыть отчёт пакета", self.show_package_report)
+        self.build_button = button(tr("Проверить и подготовить пакет…"), self.build_package, primary=True)
+        self.inventory_button = button(tr("Сохранить диагностику медиа…"), self.save_inventory)
+        self.open_report = button(tr("Открыть отчёт пакета"), self.show_package_report)
         area.addWidget(self.build_button, alignment=Qt.AlignmentFlag.AlignLeft)
         area.addLayout(bar(self.inventory_button, self.open_report))
 
     def _confirm(self, area):
         self.confirm_label = label("", "secondary")
         area.addWidget(self.confirm_label)
-        self.consent = QCheckBox("Все затрагиваемые участники согласились на этот пакет и выбранный диалог")
-        self.consent.setAccessibleName("Явное согласие участников до передачи данных Telegram")
+        self.consent = QCheckBox(tr("Все затрагиваемые участники согласились на этот пакет и выбранный диалог"))
+        self.consent.setAccessibleName(tr("Явное согласие участников до передачи данных Telegram"))
         self.consent.toggled.connect(self._consent_changed)
         area.addWidget(self.consent)
-        self.preflight = button("Проверить пакет в Telegram", self.telegram.preflight, primary=True)
+        self.preflight = button(tr("Проверить пакет в Telegram"), self.telegram.preflight, primary=True)
         area.addWidget(self.preflight, alignment=Qt.AlignmentFlag.AlignLeft)
         area.addWidget(self.telegram.make_recovery_panel())
-        area.addLayout(bar(button("Сохранить исходную границу…", self.telegram.baseline)))
+        area.addLayout(bar(button(tr("Сохранить исходную границу…"), self.telegram.baseline)))
         area.addWidget(
             label(
-                "Проверка передаёт первые строки пакета. До запуска сохраните отдельную границу на каждом тестовом аккаунте.",
+                tr("Проверка передаёт первые строки пакета. До запуска сохраните отдельную границу на каждом тестовом аккаунте."),
                 "muted",
             )
         )
@@ -263,23 +265,25 @@ class ImportWizard(QWidget):
         self.transfer_details = label("", "muted")
         area.addWidget(self.transfer_label)
         area.addWidget(self.transfer_details)
-        self.launch = button("Открыть подтверждение и начать…", self.telegram.confirm, primary=True)
-        self.cancel = button("Остановить", self.telegram.cancel)
-        self.diagnostic = button("Диагностика операции…", self.telegram.export_diagnostic)
+        self.launch = button(tr("Открыть подтверждение и начать…"), self.telegram.confirm, primary=True)
+        self.cancel = button(tr("Остановить"), self.telegram.cancel)
+        self.diagnostic = button(tr("Диагностика операции…"), self.telegram.export_diagnostic)
+        self.repair_video = button(tr("Выбрать обработку видео…"), self.telegram.repair_video)
         area.addLayout(bar(self.launch, self.cancel, self.diagnostic))
+        area.addWidget(self.repair_video, alignment=Qt.AlignmentFlag.AlignLeft)
         area.addWidget(self.telegram.make_recovery_panel())
 
     def _verification(self, area):
         self.result_label = label("", "secondary")
         area.addWidget(self.result_label)
-        self.capture = button("Снимок истории…", self.telegram.observe)
-        self.historical = button("Снимок по датам…", self.telegram.historical_observe)
-        self.compare = button("Сравнить сохранённые снимки…", self.window.compare_observations, primary=True)
+        self.capture = button(tr("Снимок истории…"), self.telegram.observe)
+        self.historical = button(tr("Снимок по датам…"), self.telegram.historical_observe)
+        self.compare = button(tr("Сравнить сохранённые снимки…"), self.window.compare_observations, primary=True)
         area.addLayout(bar(self.capture, self.historical))
         area.addWidget(self.compare, alignment=Qt.AlignmentFlag.AlignLeft)
         area.addWidget(
             label(
-                "Снимите историю отдельно с каждого аккаунта. После перезапуска Telegram проверьте даты, метку импорта, авторов, порядок и медиа в обоих клиентах.",
+                tr("Снимите историю отдельно с каждого аккаунта. После перезапуска Telegram проверьте даты, метку импорта, авторов, порядок и медиа в обоих клиентах."),
                 "muted",
             )
         )
@@ -295,7 +299,7 @@ class ImportWizard(QWidget):
     def project_changed(self):
         if self.source == "project":
             self.checked = False
-            self.history_label.setText("Открыт новый проект. Сверьте исходную историю.")
+            self.history_label.setText(tr("Открыт новый проект. Сверьте исходную историю."))
             self.invalidate_review()
             self.pages.setCurrentIndex(0)
         self.refresh()
@@ -308,9 +312,9 @@ class ImportWizard(QWidget):
         self.source = kind
         self.checked = kind == "fixture"
         self.history_label.setText(
-            "Контрольный набор создаётся локально."
+            tr("Контрольный набор создаётся локально.")
             if self.checked
-            else "Сверьте исходную историю перед подготовкой."
+            else tr("Сверьте исходную историю перед подготовкой.")
         )
         self.invalidate_review()
         with QSignalBlocker(self.mode):
@@ -359,19 +363,19 @@ class ImportWizard(QWidget):
 
             def job(progress):
                 if load_bundle(root, progress).manifest_hash() != expected:
-                    raise RecoveryError("Пакет изменился. Откройте его заново.")
+                    raise RecoveryError(tr("Пакет изменился. Откройте его заново."))
                 return {"ok": 1}
         else:
             return
 
         def ready(result):
             self.checked = bool(result.get("ok")) and not any(key != "ok" for key in result)
-            text = "Контрольные суммы совпали." if self.checked else "Есть расхождения в исходной истории."
+            text = tr("Контрольные суммы совпали.") if self.checked else tr("Есть расхождения в исходной истории.")
             self.history_label.setText(text)
             self.focus()
             return text
 
-        self.window.run_job("Сверка исходной истории", job, ready)
+        self.window.run_job(tr("Сверка исходной истории"), job, ready)
 
     def build_package(self):
         mode, project = self.mode.currentData(), self.window.project
@@ -382,14 +386,14 @@ class ImportWizard(QWidget):
                 and self.source == "project"
                 and QMessageBox.question(
                     self,
-                    "Контрольный тест",
-                    "Создать отдельный синтетический пакет без записей из открытого архива?",
+                    tr("Контрольный тест"),
+                    tr("Создать отдельный синтетический пакет без записей из открытого архива?"),
                     defaultButton=QMessageBox.StandardButton.No,
                 )
                 != QMessageBox.StandardButton.Yes
             ):
                 return
-            chosen = QFileDialog.getExistingDirectory(self, "Папка для нового пакета")
+            chosen = QFileDialog.getExistingDirectory(self, tr("Папка для нового пакета"))
             if not chosen:
                 return
             dest = Path(chosen) / ("gTR-beta-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f"))
@@ -402,11 +406,11 @@ class ImportWizard(QWidget):
         video = self.window.video_options(self.video.currentData(), annotate=self.notes.isChecked())
         kind = self.kind.currentData()
 
-        def job(progress):
+        def job(progress, **media):
             if stored:
                 bundle = load_bundle(dest, progress)
                 if bundle.manifest_hash() != stored.manifest_hash():
-                    raise RecoveryError("Пакет изменился. Откройте его заново.")
+                    raise RecoveryError(tr("Пакет изменился. Откройте его заново."))
             elif mode == "fixture":
                 bundle = prepare_fixture(dest, scenario, progress, size=size)
             else:
@@ -421,6 +425,7 @@ class ImportWizard(QWidget):
                     last_record=last,
                     record_kind=kind,
                     **video,
+                    **media,
                 )
             inventory = inspect_bundle(bundle, progress, hash_verified=True)
             evidence = check_local(bundle, associated, progress)
@@ -432,7 +437,7 @@ class ImportWizard(QWidget):
             self.focus()
             return message
 
-        self.window.run_job("Подготовка и проверка пакета", job, ready)
+        self.window.run_media_job(tr("Подготовка и проверка пакета"), job, ready, project=associated)
 
     def save_inventory(self):
         if self.inventory and self.reviewed:
@@ -510,13 +515,13 @@ class ImportWizard(QWidget):
         source = self.source
         project = self.window.project
         self.source_label.setText(
-            f"Проект · {project.name}"
+            tr('Проект · {0}').format(project.name)
             if source == "project" and project
-            else f"Готовый пакет · {self.opened.root.name}"
+            else tr('Готовый пакет · {0}').format(self.opened.root.name)
             if source == "package" and self.opened
-            else "Контрольный набор с вымышленными участниками"
+            else tr("Контрольный набор с вымышленными участниками")
             if source == "fixture"
-            else "Выберите источник для нового импорта."
+            else tr("Выберите источник для нового импорта.")
         )
         self.use_project.setEnabled(project is not None and not busy)
         self.history_button.setEnabled(source in {"project", "package"} and not busy)
@@ -526,35 +531,35 @@ class ImportWizard(QWidget):
         self.as_documents.setVisible(self.mode.currentData() == "text_media")
         self.test_options.setVisible(source != "package" and self.mode.currentData() == "fixture")
         self.mode_label.setText(
-            "Синтетические записи сохраняются в новом пакете."
+            tr("Синтетические записи сохраняются в новом пакете.")
             if self.mode.currentData() == "fixture"
-            else "Порядок, даты и смещения берутся из источника. Верхняя граница включается."
+            else tr("Порядок, даты и смещения берутся из источника. Верхняя граница включается.")
         )
         self.build_button.setText(
-            "Проверить открытый пакет" if source == "package" else "Проверить и подготовить пакет…"
+            tr("Проверить открытый пакет") if source == "package" else tr("Проверить и подготовить пакет…")
         )
         self.build_button.setEnabled(not busy and self._can_advance(3))
         if self.inventory and self.reviewed:
             data = self.reviewed.data
             parts = [
-                f"Найдено {number(data.get('source_records', len(data['records'])))} · Выбрано {number(data.get('selected_records', data['included']))} · В пакете {number(data['included'])}",
-                f"Вложений {number(self.inventory['count'])} · Блокирующих ошибок {number(self.inventory['blocked'])} · Пропущено записей {number(data['skipped'])}",
+                tr('Найдено {0} · Выбрано {1} · В пакете {2}').format(number(data.get('source_records', len(data['records']))), number(data.get('selected_records', data['included'])), number(data['included'])),
+                tr('Вложений {0} · Блокирующих ошибок {1} · Пропущено записей {2}').format(number(self.inventory['count']), number(self.inventory['blocked']), number(data['skipped'])),
             ]
             parts.extend(
-                f"{MEDIA_ISSUES.get(code, code)} — {count}"
+                f"{tr(MEDIA_ISSUES.get(code, code))} — {count}"
                 for code, count in self.inventory["issues"].items()
             )
             if self.local_report["status"] == "differences":
-                parts.append("Есть расхождения с исходным проектом.")
+                parts.append(tr("Есть расхождения с исходным проектом."))
             self.media_label.setText("\n".join(parts))
         else:
-            self.media_label.setText("Проверьте формат, размеры и контрольные суммы перед сетевой проверкой.")
+            self.media_label.setText(tr("Проверьте формат, размеры и контрольные суммы перед сетевой проверкой."))
         self.inventory_button.setEnabled(self.inventory is not None and not busy)
         self.open_report.setEnabled(self.reviewed is not None and not busy)
         self.confirm_label.setText(
             f"{account.name} · {target.title}\n{telegram.local_status.text()}"
             if key
-            else "Подключите аккаунт и выберите целевой диалог на шаге 3."
+            else tr("Подключите аккаунт и выберите целевой диалог на шаге 3.")
         )
         self.consent.setEnabled(bool(key and self._ready_package() and not busy))
         self.preflight.setEnabled(self._ready_package() and telegram.preflight_button.isEnabled())
@@ -563,38 +568,40 @@ class ImportWizard(QWidget):
         self.launch.setEnabled(self._ready_package() and telegram.start_button.isEnabled())
         self.cancel.setEnabled(telegram.busy)
         self.diagnostic.setEnabled(telegram.diagnostic_button.isEnabled())
+        self.repair_video.setVisible(not telegram.repair_video_button.isHidden())
+        self.repair_video.setEnabled(telegram.repair_video_button.isEnabled())
         self.capture.setEnabled(self._package_active() and telegram.observe_button.isEnabled())
         self.historical.setEnabled(self._package_active() and telegram.historical_button.isEnabled())
         self.compare.setEnabled(self._package_active() and not busy)
         result = self.window.comparison
         self.result_label.setText(
-            VERIFICATION_NAMES.get(result.get("verification_status"), VERIFICATION_NAMES["INCONCLUSIVE"])
+            tr(VERIFICATION_NAMES.get(result.get("verification_status"), VERIFICATION_NAMES["INCONCLUSIVE"]))
             if result
-            else "Ожидаются независимые снимки."
+            else tr("Ожидаются независимые снимки.")
         )
         index = self.pages.currentIndex()
-        self.title.setText(f"{index + 1} из {len(STEPS)} · {STEPS[index]}")
+        self.title.setText(tr('{0} из {1} · {2}').format(index + 1, len(STEPS), tr(STEPS[index])))
         self.step.setValue(index + 1)
         self.pages.setEnabled(not busy or index == 6)
         self.back.setEnabled(index > 0 and not busy)
-        self.forward.setText("Закрыть мастер" if index == len(STEPS) - 1 else "Далее")
+        self.forward.setText(tr("Закрыть мастер") if index == len(STEPS) - 1 else tr("Далее"))
         allowed = self._can_advance(index)
         self.forward.setEnabled(allowed and not busy)
         self.hint.setText(
-            "Выполняется проверка или передача."
+            tr("Выполняется проверка или передача.")
             if busy
-            else "Проверьте предыдущую операцию или подготовьте доступные новые записи."
+            else tr("Проверьте предыдущую операцию или подготовьте доступные новые записи.")
             if telegram.recovery is not None and index in (5, 6)
             else ""
             if allowed
             else (
-                "Выберите источник.",
-                "Завершите сверку.",
-                "Выберите диалог или локальную подготовку.",
-                "Выберите состав пакета.",
-                "Подготовьте пакет и устраните блокирующие ошибки.",
-                "Подтвердите согласие и завершите проверку Telegram.",
-                "Дождитесь ответа о запуске.",
+                tr("Выберите источник."),
+                tr("Завершите сверку."),
+                tr("Выберите диалог или локальную подготовку."),
+                tr("Выберите состав пакета."),
+                tr("Подготовьте пакет и устраните блокирующие ошибки."),
+                tr("Подтвердите согласие и завершите проверку Telegram."),
+                tr("Дождитесь ответа о запуске."),
                 "",
             )[index]
         )

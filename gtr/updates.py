@@ -12,11 +12,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
 from urllib.error import URLError
-from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 
-from . import BETA_NUMBER
+from . import BETA_VERSION, beta_folder, beta_label
 from .files import (
     BLOCK,
     local,
@@ -30,8 +29,9 @@ from .model import RecoveryError, quiet
 from .owner import app_home
 
 OFFICIAL_REPOSITORY = "Spalov/gTR"
-ARCHIVE = re.compile(r"gTR-Beta-([1-9][0-9]{0,4})-Windows-x64\.zip")
-FOLDER = re.compile(r"gTR-Beta-([1-9][0-9]{0,4})")
+RELEASE_PATTERN = r"gTR-Beta-([1-9][0-9]{0,4})(-Fix)?"
+ARCHIVE = re.compile(RELEASE_PATTERN + r"-Windows-x64\.zip")
+FOLDER = re.compile(RELEASE_PATTERN)
 SHA256 = re.compile(r"[a-f0-9]{64}")
 RECEIPT = ".gtr-installed.json"
 FAILED_LAUNCH = ".gtr-launch-failed"
@@ -45,6 +45,23 @@ REQUIRED = ("gTR.cmd", "gtr/__init__.py", "runtime/pythonw.exe", "runtime/python
 class Update:
     path: Path
     number: int
+    fix: bool = False
+
+    @property
+    def version(self):
+        return self.number, self.fix
+
+    @property
+    def label(self):
+        return beta_label(*self.version)
+
+    @property
+    def folder_name(self):
+        return beta_folder(*self.version)
+
+    @property
+    def tag(self):
+        return self.folder_name.removeprefix("gTR-").lower()
 
 
 def portable() -> bool:
@@ -72,15 +89,22 @@ def downloads():
     return Path.home() / "Downloads"
 
 
-def candidate(path, current=BETA_NUMBER):
+def _current_version(current):
+    # An integer refers to the original, unfixed Beta of that number.
+    return (current, False) if isinstance(current, int) else current
+
+
+def candidate(path, current=BETA_VERSION):
     path = local(Path(path))
     match = ARCHIVE.fullmatch(path.name)
-    if match and int(match[1]) > current and path.is_file() and 0 < path.stat().st_size <= MAX_ARCHIVE:
-        return Update(path, int(match[1]))
-    raise RecoveryError("Выберите скачанный ZIP выпуска gTR Beta с более высоким номером.")
+    if match and path.is_file() and 0 < path.stat().st_size <= MAX_ARCHIVE:
+        update = Update(path, int(match[1]), bool(match[2]))
+        if update.version > _current_version(current):
+            return update
+    raise RecoveryError("Выберите скачанный ZIP более нового выпуска gTR Beta.")
 
 
-def find_download(folder=None, current=BETA_NUMBER):
+def find_download(folder=None, current=BETA_VERSION):
     try:
         root = local(Path(folder or downloads()))
         latest = None
@@ -89,7 +113,7 @@ def find_download(folder=None, current=BETA_NUMBER):
                 found = candidate(path, current)
             except (OSError, RecoveryError):
                 continue
-            if latest is None or found.number > latest.number:
+            if latest is None or found.version > latest.version:
                 latest = found
         return latest
     except (OSError, RecoveryError):
@@ -97,7 +121,7 @@ def find_download(folder=None, current=BETA_NUMBER):
 
 
 def official_asset(update):
-    url = f"https://api.github.com/repos/{OFFICIAL_REPOSITORY}/releases/tags/beta-{update.number}"
+    url = f"https://api.github.com/repos/{OFFICIAL_REPOSITORY}/releases/tags/{update.tag}"
     request = Request(
         url,
         headers={
@@ -108,14 +132,13 @@ def official_asset(update):
     )
     try:
         with urlopen(request, timeout=15) as response:
-            domain = urlsplit(response.geturl())
-            if domain.scheme != "https" or domain.netloc != "api.github.com":
+            if response.geturl() != url:
                 raise ValueError
             body = response.read(1024**2 + 1)
             if len(body) > 1024**2:
                 raise ValueError
         release = json.loads(body)
-        if release["tag_name"] != f"beta-{update.number}" or release["draft"]:
+        if release["tag_name"] != update.tag or release["draft"]:
             raise ValueError
         asset = next(
             x for x in release["assets"] if x["name"] == update.path.name and x["state"] == "uploaded"
@@ -187,8 +210,8 @@ def _versions():
     return local(app_home() / "versions")
 
 
-def install(update, progress=quiet):
-    update = candidate(update.path)
+def install(update, progress=quiet, *, current=BETA_VERSION):
+    update = candidate(update.path, current)
     progress("verify_update", 0, 0)
     size, digest = official_asset(update)
     root = _versions()
@@ -198,7 +221,7 @@ def install(update, progress=quiet):
         pass
     else:
         private_directory(root)
-    dest = root / f"gTR-Beta-{update.number}"
+    dest = root / update.folder_name
     try:
         with TemporaryDirectory(dir=root, prefix=".gtr-download-") as temporary:
             folder = Path(temporary)
@@ -208,7 +231,7 @@ def install(update, progress=quiet):
             with new_directory(dest) as work:
                 _extract(copy, work, dest.name, progress)
                 with (work / RECEIPT).open("x", encoding="ascii") as output:
-                    json.dump({"beta": update.number, "sha256": digest}, output)
+                    json.dump({"beta": update.number, "fix": update.fix, "sha256": digest}, output)
     except (OSError, BadZipFile, RuntimeError, ValueError):
         raise RecoveryError(
             "Не удалось установить обновление. Проверьте свободное место и целостность архива."
@@ -216,12 +239,16 @@ def install(update, progress=quiet):
     return dest
 
 
-def installed_update(current=BETA_NUMBER):
+def installed_update(current=BETA_VERSION):
     latest = None
+    current = _current_version(current)
     try:
         for folder in _versions().glob("gTR-Beta-*"):
             match = FOLDER.fullmatch(folder.name)
-            if not match or int(match[1]) <= current:
+            if not match:
+                continue
+            version = int(match[1]), bool(match[2])
+            if version <= current:
                 continue
             try:
                 folder = local(folder)
@@ -229,13 +256,17 @@ def installed_update(current=BETA_NUMBER):
                     continue
                 with local(folder / RECEIPT).open("rb") as marker:
                     data = json.loads(marker.read(256))
-                if data["beta"] != int(match[1]) or not SHA256.fullmatch(data["sha256"]):
+                if type(data["beta"]) is not int or data["beta"] != version[0]:
+                    continue
+                if data.get("fix", False) is not version[1]:
+                    continue
+                if not SHA256.fullmatch(data["sha256"]):
                     continue
                 if any(not local(folder / name).is_file() for name in REQUIRED):
                     continue
             except (OSError, RecoveryError, ValueError, TypeError, KeyError):
                 continue
-            current, latest = int(match[1]), folder
+            current, latest = version, folder
     except (OSError, RecoveryError):
         return None
     return latest

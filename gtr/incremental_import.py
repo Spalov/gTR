@@ -823,6 +823,10 @@ def recover_package(journal, job, progress=quiet):
                 sample=selection.get("sample"),
                 record_ranges=selection.get("ranges"),
                 test_reset_id=data.get("test_reset_id"),
+                video_policy=data.get("video_policy"),
+                video_decisions=data.get("video_decisions"),
+                annotate=data.get("annotate", False),
+                record_kind=selection.get("record_kind", "all"),
             )
             if built.manifest_hash() != sha or check_local(built, project, progress)["status"] != "verified":
                 raise RecoveryError("Пересобранный пакет отличается от сохранённого манифеста.")

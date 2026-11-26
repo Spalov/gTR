@@ -138,8 +138,8 @@ def test_self_profile_with_avatar_and_last_seen(monkeypatch):
     assert (result.username, result.age, result.last_seen, result.avatar) == ("", "", "", b"")
 
 
-def update_file(folder, beta, *, extra=None):
-    root = f"gTR-Beta-{beta}"
+def update_file(folder, beta, *, fix=False, extra=None):
+    root = f"gTR-Beta-{beta}" + ("-Fix" if fix else "")
     filename = folder / f"{root}-Windows-x64.zip"
     with ZipFile(filename, "w") as package:
         for name in updates.REQUIRED:
@@ -152,7 +152,7 @@ def update_file(folder, beta, *, extra=None):
 def asset_data(update, *, digest=None):
     raw = update.path.read_bytes()
     return {
-        "tag_name": f"beta-{update.number}",
+        "tag_name": f"beta-{update.number}" + ("-fix" if update.fix else ""),
         "draft": False,
         "assets": [
             {
@@ -204,6 +204,54 @@ def test_official_update_installs_separately_and_uses_existing_data(tmp_path, mo
     assert original.read_text() == "previous build"
     assert config.read_text() == "existing data"
     assert stages == {"verify_update", "extract_update"}
+
+
+def test_fix_is_ordered_after_its_original_beta_and_before_the_next(tmp_path):
+    original = update_file(tmp_path, 5)
+    fixed = update_file(tmp_path, 5, fix=True)
+    older = update_file(tmp_path, 4, fix=True)
+    with pytest.raises(RecoveryError):
+        updates.candidate(original, current=5)
+    with pytest.raises(RecoveryError):
+        updates.candidate(older, current=5)
+    assert updates.find_download(tmp_path, current=5) == updates.Update(fixed, 5, fix=True)
+    assert updates.find_download(tmp_path, current=(5, True)) is None
+    later = update_file(tmp_path, 6)
+    assert updates.find_download(tmp_path, current=5) == updates.Update(later, 6)
+    assert updates.find_download(tmp_path, current=(5, True)) == updates.Update(later, 6)
+
+
+def test_install_beta_5_fix_uses_its_own_tag_and_preserves_previous_installation(tmp_path, monkeypatch):
+    archive = update_file(tmp_path, 5, fix=True)
+    update = updates.candidate(archive, current=5)
+    assert update.label == "Beta 5 (Fix)"
+    assert update.tag == "beta-5-fix"
+    previous = app_home() / "versions" / "gTR-Beta-5"
+    previous.mkdir(parents=True)
+    for name in updates.REQUIRED:
+        item = previous / name
+        item.parent.mkdir(parents=True, exist_ok=True)
+        item.write_bytes(b"previous build")
+    (previous / updates.RECEIPT).write_text(json.dumps({"beta": 5, "sha256": "0" * 64}))
+    assert updates.installed_update(current=4) == previous
+    local_journal = app_home() / "imports.sqlite"
+    local_journal.write_bytes(b"existing local data")
+
+    mock_release(monkeypatch, asset_data(update) | {"tag_name": "beta-5-fix"})
+    installed = updates.install(update, current=5)
+    assert installed.name == "gTR-Beta-5-Fix"
+    assert updates.installed_update(current=5) == installed
+    assert updates.installed_update(current=(5, True)) is None
+    assert (previous / "gTR.cmd").read_bytes() == b"previous build"
+    assert local_journal.read_bytes() == b"existing local data"
+
+    receipt_path = installed / updates.RECEIPT
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["fix"] is True
+    receipt.pop("fix")
+    receipt_path.write_text(json.dumps(receipt))
+    assert updates.installed_update(current=5) is None
+    assert updates.installed_update(current=4) == previous
 
 
 def test_update_leaves_no_installation_when_digest_differs(tmp_path, monkeypatch):
