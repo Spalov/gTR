@@ -9,6 +9,7 @@ from zipfile import BadZipFile, ZipFile
 from .core import catalogue, properties, verify
 from .filenames import assign_names
 from .history import HistoricalIdentity, ordered_rows
+from .media_recovery import force_file, represent, source_digest
 from .model import quiet
 from .payloads import plan_media
 from .structure import annotated_text, historical_notes
@@ -30,7 +31,7 @@ def _payload_matches(bundle, actual, expected):
             and actual["sha256"] == expected["sha256"]
             and actual.get("attributes", {}) == expected.get("attributes", {})
             and actual.get("transform") == expected.get("transform")
-            and actual.get("force_file", False) == expected.get("force_file", False)
+            and (actual["upload_as"] == "photo" or force_file(actual) == force_file(expected))
         )
     listed = actual.get("members", [])
     if len(listed) != len(expected["members"]):
@@ -157,27 +158,46 @@ def check_local(bundle, project: Path | None, progress=quiet) -> dict:
                     if mode != "text_only":
                         policy = bundle.data.get("video_policy")
                         decision = record.get("video_recovery")
+                        recovery = record.get("media_recovery")
                         group_skip = decision and decision.get("scope") == "group" and decision.get("action") == "skip"
                         payload = plan_media(
                             [item for item in files if item["kind"] not in VIDEO_KINDS] if group_skip else files,
                             meta, asset_ordinal + 1, [], documents_only=mode == "document",
                             missing_references=policy is None,
                         )
+                        if decision and decision.get("scope") == "group" and decision.get("action") == "local":
+                            payload = None
                         if policy and mode == "text_media" and payload and payload["kind"] in {"audio", "voice"}:
                             audio = record.get("audio_recovery", {})
                             if audio.get("attributes"):
                                 payload.update(attributes=audio["attributes"], representation="specialized_document")
-                            elif audio.get("status") == "audio_unreadable":
+                            elif audio.get("status") == "audio_unreadable" and not recovery:
                                 payload = None
+                            elif audio.get("status") == "audio_unconfirmed" and bundle.data.get("binding_version"):
+                                payload.update(attributes={}, representation="document", force_file=True)
                         if payload and payload["kind"] in VIDEO_KINDS and policy and mode == "text_media":
                             if (
                                 not isinstance(decision, dict)
                                 or decision.get("original_sha256") != payload["sha256"]
-                                or decision.get("action") not in {"keep", "convert", "document", "skip"}
+                                or decision.get("action") not in {"keep", "convert", "document", "skip", "local"}
                             ):
                                 differences.append({"code": "video_provenance", "ordinal": i})
                             else:
                                 payload = video_representation(payload, decision)
+                        if recovery:
+                            if (
+                                not bundle.data.get("media_workflow") or not payload
+                                or recovery.get("original_sha256") != source_digest(payload)
+                                or recovery.get("action") not in {"sticker", "image", "document", "local", "skip"}
+                                or recovery.get("action") == "sticker" and (
+                                    payload["kind"] != "sticker" or recovery.get("mime") != payload["mime"]
+                                    or recovery.get("emoji") != str(meta.get("sticker_emoji") or "")[:80]
+                                )
+                                or recovery.get("action") == "image" and payload["mime"] != "image/webp"
+                            ):
+                                differences.append({"code": "package_media", "ordinal": i})
+                            else:
+                                payload = represent(payload, recovery)
                         if payload and bundle.data.get("filename_version"):
                             assign_names(payload, meta, used_names)
                     elif not original["text"].strip():

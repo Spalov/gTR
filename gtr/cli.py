@@ -81,7 +81,7 @@ def arguments():
                            help="Как подготовить видео. compatible разрешает перекодирование копии")
         video.add_argument("--auto-compatible-videos", action="store_true",
                            help="Разрешить создание совместимых копий для выбранного архива")
-        convert.add_argument("--video-decisions", type=Path,
+        convert.add_argument("--media-decisions", "--video-decisions", dest="video_decisions", type=Path,
                              help="JSON с решениями по ключам из локального плана")
         convert.add_argument("--ffmpeg", type=Path)
         convert.add_argument("--ffprobe", type=Path)

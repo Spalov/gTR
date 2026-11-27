@@ -17,7 +17,15 @@ def test_cli_complete_offline_flow(tmp_path, synthetic, capsys):
     assert json.loads(capsys.readouterr().out)[0]["id"] == 1
     assert main(["verify", str(p)]) == 0
     assert json.loads(capsys.readouterr().out) == {"ok": 9}
-    assert main(["prepare", str(p), "--chat", "1", "--out", str(b), "--video-policy", "document"]) == 0
+    command = ["prepare", str(p), "--chat", "1", "--out", str(b), "--video-policy", "document"]
+    assert main(command) == 2
+    pending = json.loads(capsys.readouterr().err)["media_decisions_required"]
+    assert {item["source_kind"] for item in pending} == {"voice", "audio"}
+    choices = tmp_path / "attachment-choices.json"
+    choices.write_text(json.dumps({
+        item["key"]: "skip" if item["source_kind"] == "voice" else "document" for item in pending
+    }), encoding="utf-8")
+    assert main([*command, "--media-decisions", str(choices)]) == 0
     assert json.loads(capsys.readouterr().out)["media_count"] == 7
     assert main(["simulate", str(b)]) == 0
     assert json.loads(capsys.readouterr().out)["mode"] == "mock"

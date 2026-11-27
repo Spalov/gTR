@@ -99,6 +99,7 @@ private:
     QLabel *dialog_;
     QLabel *analysis_;
     QTableWidget *issues_;
+    QPushButton *applyMediaGroup_;
     QLabel *result_;
     QLabel *diagnosis_;
     QListWidget *steps_;

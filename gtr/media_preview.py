@@ -16,6 +16,7 @@ from .video import DEMUXERS, _input, _run, gge_probe
 
 MAX_PIXELS = 16_000_000
 MAX_FRAME_BYTES = 1024 * 1024
+PREVIEW_SIZE = QSize(640, 420)
 VIDEO_MIME = {mime for mime in DEMUXERS if mime.startswith("video/")}
 
 
@@ -44,22 +45,33 @@ class FFmpegThumbnail:
 
 
 
-def _scaled_image(reader):
+def read_image(reader, max_size=None):
     reader.setDecideFormatFromContent(True)
     reader.setAutoTransform(True)
     size = reader.size()
     if not size.isValid() or not 0 < size.width() * size.height() <= MAX_PIXELS:
         return QImage()
-    reader.setScaledSize(size.scaled(QSize(640, 420), Qt.AspectRatioMode.KeepAspectRatio))
+    if max_size is not None:
+        reader.setScaledSize(size.scaled(max_size, Qt.AspectRatioMode.KeepAspectRatio))
     return reader.read()
 
 
-def _decode_preview(data):
+def _decode_preview(data, max_size=PREVIEW_SIZE):
     if not data or len(data) > MAX_FRAME_BYTES or not data.startswith(b"\x89PNG\r\n\x1a\n"):
         return QImage()
     buffer = QBuffer()
     buffer.setData(QByteArray(data))
-    return _scaled_image(QImageReader(buffer)) if buffer.open(QIODevice.OpenModeFlag.ReadOnly) else QImage()
+    return read_image(QImageReader(buffer), max_size) if buffer.open(QIODevice.OpenModeFlag.ReadOnly) else QImage()
+
+
+def save_compatible_png(source, target, progress):
+    """Write a full-size static WebP copy with GGE, or use the installed Qt decoder."""
+    picture = _decode_preview(gge_probe(source, "image-copy", progress), None)
+    if picture.isNull():
+        picture = read_image(QImageReader(str(source), b"webp"))
+    if picture.isNull() or not picture.save(str(target), "PNG"):
+        raise RecoveryError("Не удалось создать совместимую копию изображения.")
+    return picture.hasAlphaChannel()
 
 
 def _waveform(path):
@@ -102,7 +114,7 @@ def preview(path, expected_hash, declared_mime=None, *, provider=None, progress=
         raise RecoveryError("Файл недоступен или изменился после анализа.")
     picture = QImage()
     if facts.mime in PICTURE_TYPES and "corrupt_container" not in facts.issues:
-        picture = _scaled_image(QImageReader(str(path)))
+        picture = read_image(QImageReader(str(path)), PREVIEW_SIZE)
         if picture.isNull():
             picture = _decode_preview(gge_probe(path, "image", progress))
     elif facts.mime == "audio/wav" and "corrupt_container" not in facts.issues:

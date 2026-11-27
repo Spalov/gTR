@@ -41,6 +41,13 @@ from .media_queue import (
     validate_decisions,
     video_decision_key,
 )
+from .media_recovery import (
+    SKIP_ACTIONS,
+    queue_attachment,
+    recovery_entry,
+    source_digest,
+)
+from .media_recovery import VERSION as MEDIA_WORKFLOW
 from .model import RecoveryError, quiet
 from .payloads import STRUCTURED, plan_media, publish_media, validate_media_input
 from .profiles import MARKER, MEDIA_NAME, PROFILES, read_records, wire_line
@@ -95,6 +102,10 @@ LOSS = {
     "video_document": "Пользователь выбрал передачу видео документом",
     "video_skipped": "Несовместимое видео пропущено по выбору пользователя",
     "video_transcode": "Для видео выбрана совместимая копия H.264/AAC",
+    "attachment_decision": "Для вложения требуется выбрать обработку",
+    "media_local_only": "Оригинал оставлен в локальном проекте",
+    "media_skipped": "Вложение исключено из пакета по выбору пользователя",
+    "media_png": "Подготовлена копия изображения PNG",
     "type_selection": "Тип записи вне выборки",
     "sample_limit": "Запись за пределами экспериментальной выборки",
     "outside_selection": "Запись за пределами выбранного диапазона",
@@ -211,14 +222,26 @@ def _group_video(entry, action, queue):
     queue.start(entry["name"])
     record = {"key": entry["key"], "scope": "group", "action": action,
               "original": {"status": "multiple_attachments"}}
-    if action in {"document", "skip"}:
+    if action in {"document", "skip", "local"}:
         queue.finish()
     else:
         record["action"] = "blocked"
-        entry.update(group="multiple_attachments", original=record["original"],
-                     options=("document", "skip"), reason="multiple_attachments", recommended=None)
+        entry.update(group="multiple_attachments", original=record["original"], source_kind="video",
+                     prepared_kind="document", options=("document", "local", "skip"),
+                     reason="multiple_attachments", recommended="document")
         queue.finish(entry)
     return record
+
+
+def media_entry(item, meta, row, source_hash, chat_id, source_ordinal):
+    if item["source"]:
+        return _video_entry(item, meta, row, source_hash, chat_id, source_ordinal)
+    original = source_digest(item)
+    return {
+        "key": video_decision_key(source_hash, chat_id, source_ordinal, original),
+        "name": item["name"], "date": row["date_iso"] or row["date_raw"], "source": "",
+        "size": item["size"], "sha256": original,
+    }
 
 
 def plan_import(
@@ -245,6 +268,9 @@ def plan_import(
     annotation_language="ru",
     record_kind="all",
     binding_version=BINDING_VERSION,
+    media_workflow=None,
+    reuse_records=None,
+    reused_paths=None,
 ):
     """Build the same ledger for a read-only preview and for a published package."""
     try:
@@ -272,13 +298,15 @@ def plan_import(
     if record_ranges is not None:
         record_ranges = decode_intervals(record_ranges)
     video_decisions = validate_decisions(video_decisions)
-    if video_decisions and not video_policy:
+    if media_workflow is None:
+        media_workflow = bool(video_policy or video_decisions)
+    if video_decisions and not video_policy and reuse_records is None:
         video_policy = "original"
     media_queue = media_queue or MediaQueue()
     starts = tuple(first for first, _ in record_ranges or ())
     date_policy = "historical"
     profile = PROFILES[profile]
-    if video_policy and media_mode == "text_media" and media_tools is None:
+    if (video_policy or media_workflow) and media_mode == "text_media" and media_tools is None:
         media_tools = MediaTools()
     with catalogue(project) as db:
         chat = db.execute("SELECT title FROM chats WHERE id=?", (chat_id,)).fetchone()
@@ -296,16 +324,16 @@ def plan_import(
             )
         }
         total = db.execute("SELECT count(*) FROM messages WHERE chat=?", (chat_id,)).fetchone()[0]
-        planned_videos = 0
-        if video_policy and media_mode == "text_media":
-            planned_videos = db.execute(
+        planned_media = 0
+        if media_mode == "text_media" and (media_workflow or video_policy):
+            planned_media = db.execute(
                 """SELECT count(*) FROM messages m WHERE m.chat=? AND NOT m.service
                 AND coalesce(json_extract(m.meta,'$.source_ordinal'),?) BETWEEN ? AND ?
-                AND EXISTS (SELECT 1 FROM assets a WHERE a.msg=m.id AND a.kind IN ('video','round_video')
+                AND EXISTS (SELECT 1 FROM assets a WHERE a.msg=m.id AND (? OR a.kind IN ('video','round_video'))
                     AND a.status IN ('ok','unconfirmed_type'))""",
-                (chat_id, first_record, first_record, last_record or 2**31 - 1),
+                (chat_id, first_record, first_record, last_record or 2**31 - 1, bool(media_workflow)),
             ).fetchone()[0]
-        media_queue.begin(planned_videos)
+        media_queue.begin(planned_media)
         rows = ordered_rows(db, chat_id)
         clock = WireClock(first_reliable_time(db, chat_id), zone, date_policy)
         duplicates = db.execute("SELECT count(*) FROM duplicates WHERE chat=?", (chat_id,)).fetchone()[0]
@@ -329,7 +357,7 @@ def plan_import(
             in_sample = sample is None or included < sample
             reason = skip_reason(row, ambiguous)
             notes, body, item = [], row["text"], None
-            video = audio = None
+            video = audio = recovery = reused_path = None
             identity = HistoricalIdentity.read(row, flags)
             assets = db.execute(
                 """SELECT a.*,f.size,f.sha256,f.mime FROM assets a
@@ -361,8 +389,23 @@ def plan_import(
                     assets, meta, len(media) + 1, notes, documents_only=media_mode == "document",
                     missing_references=video_policy is None,
                 )
+                previous = (reuse_records or {}).get(source_ordinal)
+                if previous:
+                    old, old_item, reused_path = previous
+                    item = dict(old_item) if old_item else None
+                    if item:
+                        suffix = Path(item["storage_name"]).suffix
+                        item["name"] = f"gtr-{len(media) + 1:07d}{suffix}"
+                        if not item.get("source"):
+                            item.pop("display_name", None)
+                        if "members" in item:
+                            item["members"] = [dict(member) for member in item["members"]]
+                    notes = list(old["losses"])
+                    video = old.get("video_recovery")
+                    audio = old.get("audio_recovery")
+                    recovery = old.get("media_recovery")
                 grouped_video = bool(item and any(member["kind"] in VIDEO_KINDS for member in item.get("members", [])))
-                if video_policy and media_mode == "text_media" and grouped_video:
+                if not previous and video_policy and media_mode == "text_media" and grouped_video:
                     entry = _video_entry(item, meta, row, source_hash, chat_id, source_ordinal, grouped=True)
                     video = _group_video(entry, video_decisions.get(entry["key"], video_policy), media_queue)
                     if video["action"] == "document":
@@ -374,11 +417,14 @@ def plan_import(
                             len(media) + 1, notes, missing_references=False,
                         )
                         notes.append("video_skipped")
+                    elif video["action"] == "local":
+                        item = None
+                        notes.append("media_local_only")
                     else:
                         reason = "video_decision"
                         item = None
                 if (
-                    media_tools and video_policy and media_mode == "text_media"
+                    not previous and media_tools and video_policy and media_mode == "text_media"
                     and item and item["source"] and item["kind"] in VIDEO_KINDS
                 ):
                     source = Path(project).joinpath("source", *safe_parts(item["source"]))
@@ -391,10 +437,10 @@ def plan_import(
                     if video["action"] == "blocked":
                         reason = "video_decision"
                     elif key := {"document": "video_document", "skip": "video_skipped",
-                                  "convert": "video_transcode"}.get(video["action"]):
+                                  "local": "media_local_only", "convert": "video_transcode"}.get(video["action"]):
                         notes.append(key)
                 if (
-                    media_tools and video_policy and media_mode == "text_media"
+                    not previous and media_tools and video_policy and media_mode == "text_media"
                     and item and item["source"] and item["kind"] in {"audio", "voice"}
                 ):
                     source = Path(project).joinpath("source", *safe_parts(item["source"]))
@@ -403,13 +449,38 @@ def plan_import(
                     if attributes:
                         notes = [key for key in notes if key not in {"document_fallback", "media_attributes"}]
                         item.update(attributes=attributes, representation="specialized_document")
-                    elif audio["status"] == "audio_unreadable":
+                    elif audio["status"] == "audio_unreadable" and not media_workflow:
                         item = None
                         notes.append("audio_unreadable")
-                    else:
+                    elif not media_workflow:
                         notes.append("audio_unconfirmed")
                         if binding_version:
                             item.update(attributes={}, representation="document", force_file=True)
+                if not previous and item and media_workflow and not video:
+                    entry = media_entry(item, meta, row, source_hash, chat_id, source_ordinal)
+                    choice = video_decisions.get(entry["key"])
+                    if item["source"] and (media_mode == "text_media" or choice):
+                        source = Path(project).joinpath("source", *safe_parts(item["source"]))
+                        item, recovery = queue_attachment(
+                            item, source, meta, progress, video_work, media_queue, entry, choice, media_tools, audio=audio
+                        )
+                    elif choice in SKIP_ACTIONS:
+                        recovery = {"key": entry["key"], "action": choice, "source_kind": item["kind"],
+                                    "original_sha256": entry["sha256"]}
+                        item = None
+                    if recovery:
+                        action = recovery["action"]
+                        notes = [key for key in notes if key not in {"document_fallback", "media_attributes"}]
+                        if action == "blocked":
+                            reason = "attachment_decision"
+                        elif note := {
+                            "local": "media_local_only", "skip": "media_skipped", "image": "media_png",
+                            "document": "document_fallback", "sticker": "media_attributes",
+                        }.get(action):
+                            notes.append(note)
+                if (item and media_workflow and not previous
+                        and item["upload_as"] == "document" and not item.get("attributes")):
+                    item["force_file"] = True
                 if not reason and not body and not item:
                     reason = "empty"
             date, change = (
@@ -453,6 +524,8 @@ def plan_import(
                 record["video_recovery"] = video
             if audio:
                 record["audio_recovery"] = audio
+            if recovery:
+                record["media_recovery"] = recovery
             if media_mode == "text_only":
                 record["omitted_media_count"] = len(assets)
             if reason:
@@ -464,6 +537,8 @@ def plan_import(
                     assign_names(item, meta, used_names)
                     if binding_version:
                         bind(source_hash, chat_id, record, item, len(media) + 1, date, profile)
+                    if reused_path:
+                        reused_paths[item["name"]] = reused_path
                 if not row["source_id"]:
                     notes.append("missing_source_id")
                 if change:
@@ -485,7 +560,10 @@ def plan_import(
                 if item:
                     record["media"] = item["name"]
                     media.append(item)
-                notes.extend(_text_losses(row, flags, meta))
+                if not (reuse_records or {}).get(source_ordinal):
+                    notes.extend(_text_losses(row, flags, meta))
+                if media_workflow:
+                    notes[:] = list(dict.fromkeys(notes))
             records.append(record)
             losses.update(notes)
     media_queue.settle()
@@ -493,6 +571,7 @@ def plan_import(
         "schema": 3,
         "filename_version": 1,
         **({"binding_version": binding_version} if binding_version else {}),
+        **({"media_workflow": MEDIA_WORKFLOW} if media_workflow else {}),
         "source_conversation": source_props.get(f"chat_peer:{chat_id}", ""),
         "source_title_unique": title_unique,
         "profile": profile,
@@ -568,6 +647,8 @@ def prepare(
     annotation_language="ru",
     record_kind="all",
     binding_version=BINDING_VERSION,
+    media_workflow=None,
+    reuse_records=None,
 ):
     from .reports import package_html
 
@@ -579,6 +660,7 @@ def prepare(
     with catalogue(project) as db:
         original = Path(properties(db)["original"])
     media_queue = media_queue or MediaQueue()
+    reused_paths = {}
     with new_directory(dest, (project, original)) as work:
         with (work / "_chat.txt").open("xb") as transcript:
             data = plan_import(
@@ -604,6 +686,9 @@ def prepare(
                 annotation_language=annotation_language,
                 record_kind=record_kind,
                 binding_version=binding_version,
+                media_workflow=media_workflow,
+                reuse_records=reuse_records,
+                reused_paths=reused_paths,
             )
         if data.get("media_decisions_required"):
             raise MediaDecisionRequired(data["media_decisions_required"])
@@ -614,7 +699,7 @@ def prepare(
                 skipped = included_intervals([
                     {**r, "included": True} for r in data["records"]
                     if not r["included"] and "empty" in r["losses"]
-                    and r.get("video_recovery", {}).get("action") == "skip"
+                    and (r.get("media_recovery") or r.get("video_recovery") or {}).get("action") in SKIP_ACTIONS
                 ])
                 if not actual or difference(actual, reviewed) or difference(difference(reviewed, actual), skipped):
                     raise RecoveryError("Состав доступных записей изменился. Повторите сверку исходного проекта.")
@@ -627,10 +712,16 @@ def prepare(
         estimated = sum(item["size"] for item in data["media"])
         if estimated > MAX_TOTAL_BYTES:
             raise RecoveryError("Объём вложений превышает локальный предел пакета.")
-        _require_space(work, sum(item["size"] for item in data["media"] if not item.get("transform")))
+        _require_space(work, sum(item["size"] for item in data["media"]
+                                 if not item.get("transform") or item["name"] in reused_paths))
         for i, item in enumerate(data["media"], 1):
             path = work / "media" / item["storage_name"]
-            if item.get("transform"):
+            if source := reused_paths.get(item["name"]):
+                checkpoint = lambda i=i: progress("media", i - 1, len(data["media"]))
+                _copy_bounded(source, path, item["size"], checkpoint)
+                if digest(path, checkpoint) != item["sha256"]:
+                    raise RecoveryError("Сохранённое вложение изменилось во время подготовки.")
+            elif item.get("transform"):
                 (work / ".video" / item["storage_name"]).replace(path)
             else:
                 publish_media(
@@ -658,7 +749,7 @@ def prepare(
 
 def prepare_eligible(
     project, bundle, dest, eligible, progress=quiet, *, video_decisions=None,
-    media_queue=None, media_tools=None, video_policy=None,
+    media_queue=None, media_tools=None, video_policy=None, repair=False,
 ):
     """Regenerate only the reviewed eligible records from the associated source project."""
     from .integrity import check_local
@@ -667,10 +758,30 @@ def prepare_eligible(
     eligible = decode_intervals(eligible)
     if not eligible or selected is None or difference(eligible, selected) or bundle.data["schema"] != 3:
         raise RecoveryError("Выборка новых записей недоступна для этого пакета.")
+    if repair:
+        checked = load_bundle(bundle.root, progress)
+        if checked.manifest_hash() != bundle.manifest_hash():
+            raise RecoveryError("Пакет изменился после выбора. Откройте его снова.")
+        bundle = checked
     if project is None or check_local(bundle, project, progress)["status"] != "verified":
         raise RecoveryError("Откройте и проверьте исходный проект этого пакета.")
     profile = next(name for name, value in PROFILES.items() if value == bundle.data["profile"])
     overrides = dict(validate_decisions(video_decisions))
+    originals = None
+    if repair:
+        by_name = {item["name"]: item for item in bundle.data["media"]}
+        originals = {}
+        changed = set()
+        for row in bundle.data["records"]:
+            if not row["included"]:
+                continue
+            item = by_name.get(row.get("media"))
+            if item and (key := recovery_entry(bundle, row, item)["key"]) in overrides:
+                changed.add(key)
+            else:
+                originals[row["source_ordinal"]] = (row, item, bundle.media_path(item) if item else None)
+        if not changed or changed != overrides.keys():
+            raise RecoveryError("Решение не соответствует вложениям сохранённого пакета.")
     for row in bundle.data["records"]:
         previous = row.get("video_recovery", {})
         key = previous.get("key")
@@ -696,6 +807,8 @@ def prepare_eligible(
         annotation_mode=bundle.data.get("annotation_mode", "detailed"),
         annotation_language=bundle.data.get("annotation_language", "ru"),
         record_kind=bundle.data.get("selection", {}).get("record_kind", "all"),
+        media_workflow=True if repair or bundle.data.get("media_workflow") else None,
+        reuse_records=originals,
     )
 
 
@@ -741,6 +854,9 @@ def load_bundle(root, progress=quiet):
         if "test_reset_id" in data and (type(data["test_reset_id"]) is not int or data["test_reset_id"] < 0):
             raise ValueError
         modern = "media_mode" in data
+        workflow = data.get("media_workflow", 0)
+        if type(workflow) is not int or workflow not in (0, MEDIA_WORKFLOW):
+            raise ValueError
         binding = data.get("binding_version", 0)
         if type(binding) is not int or binding not in (0, BINDING_VERSION):
             raise AttachmentBindingError()
@@ -770,7 +886,12 @@ def load_bundle(root, progress=quiet):
         converted = {
             row.get("media") for row in data["records"]
             if (decision := row.get("video_recovery")) and decision.get("action") == "convert"
-            and choices.get(decision.get("key")) in {"compatible", "reencode"}
+            and choices.get(decision.get("key")) in {"compatible", "reencode", "remux", "fidelity", "compact"}
+        }
+        images = {
+            row.get("media"): decision for row in data["records"]
+            if (decision := row.get("media_recovery")) and decision.get("action") == "image"
+            and choices.get(decision.get("key")) == "image"
         }
         if data.get("video_policy") not in (None, *VIDEO_POLICIES):
             raise ValueError
@@ -870,13 +991,24 @@ def load_bundle(root, progress=quiet):
             if total_bytes > MAX_TOTAL_BYTES:
                 raise ValueError
             transform = item.get("transform")
-            if transform and (
-                not isinstance(transform, dict) or (data.get("video_policy") != "compatible" and name not in converted)
-                or transform.get("type") != "mp4_h264_aac" or item["mime"] != "video/mp4"
-                or not re.fullmatch(r"[a-f0-9]{64}", transform.get("original_sha256", ""))
-                or item.get("attributes", {}).get("video_codec") != "h264"
-            ):
-                raise ValueError
+            if transform:
+                if not isinstance(transform, dict) or not re.fullmatch(r"[a-f0-9]{64}", transform.get("original_sha256", "")):
+                    raise ValueError
+                if transform.get("type") == "png_image":
+                    decision = images.get(name)
+                    if (
+                        not workflow or not decision or item["mime"] != "image/png"
+                        or type(decision.get("alpha")) is not bool or item.get("force_file") is not decision["alpha"]
+                        or transform["original_sha256"] != decision.get("original_sha256")
+                        or any(item[key] != decision.get(key) for key in ("size", "sha256"))
+                    ):
+                        raise ValueError
+                elif (
+                    transform.get("type") != "mp4_h264_aac" or item["mime"] != "video/mp4"
+                    or (data.get("video_policy") not in {"compatible", "remux", "fidelity", "compact"} and name not in converted)
+                    or item.get("attributes", {}).get("video_codec") != "h264"
+                ):
+                    raise ValueError
             try:
                 validate_media_input(item, path, strict=modern)
                 if (path.stat().st_size != item["size"]

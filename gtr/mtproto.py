@@ -8,6 +8,7 @@ from time import monotonic
 from .bindings import UNRESOLVED, requested_kind, wire_name
 from .faults import FAULTS, ImportFault
 from .filenames import display_name
+from .media_recovery import DOCUMENT_ATTRIBUTES, force_file, observed_media_kind
 
 PART_KIB = 512
 READ_RETRY_CODES = {"TIMEOUT", "CONNECTION_LOST", "SERVER_FAILURE"}
@@ -153,7 +154,7 @@ class TelegramAPI:
             file=file,
             mime_type=item["mime"],
             attributes=attributes,
-            force_file=item.get("force_file", item["kind"] in {"document", "contact", "location"}),
+            force_file=force_file(item),
             nosound_video=True if details.get("type") == "video" and details.get("nosound") else None,
         )
 
@@ -188,20 +189,23 @@ class TelegramAPI:
             )
         )
         constructor = type(result).__name__
-        if not (
+        if on_details := getattr(stage, "response_details", None):
+            document = getattr(result, "document", None)
+            attributes = {type(attribute).__name__ for attribute in getattr(document, "attributes", ())}
+            on_details(getattr(document, "mime_type", None), [name for name in DOCUMENT_ATTRIBUTES if name in attributes])
+        valid = (
             isinstance(result, self.types.MessageMediaPhoto)
             and isinstance(result.photo, self.types.Photo)
             or isinstance(result, self.types.MessageMediaDocument)
             and isinstance(result.document, self.types.Document)
-        ):
-            raise ImportFault("MEDIA_INVALID", response_constructor=constructor)
-        from .video import VIDEO_KINDS, observed_media_kind
-
-        actual = observed_media_kind(result)
+        )
+        actual = observed_media_kind(result) if valid else "unsupported"
         if on_response := getattr(stage, "response", None):
             on_response(actual)
+        if not valid:
+            raise ImportFault("MEDIA_INVALID", response_constructor=constructor)
         if (
-            ("wire_name" in item or (item.get("attributes", {}).get("type") == "video" and item["kind"] in VIDEO_KINDS))
+            ("wire_name" in item or item.get("attributes", {}).get("type") == "video")
             and actual != requested_kind(item)
         ):
             raise ImportFault("MEDIA_TYPE_CHANGED", response_constructor=constructor)

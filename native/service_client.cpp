@@ -151,7 +151,8 @@ void ServiceClient::consume(const QByteArray &line) {
         return;
     }
     const auto result = message["result"].toObject();
-    const auto error = message["error"].toObject()["code"].toString();
+    const auto failure = message["error"].toObject();
+    const auto error = failure["code"].toString();
     if (id == hello_) {
         startup_.stop();
         hello_ = 0;
@@ -171,7 +172,7 @@ void ServiceClient::consume(const QByteArray &line) {
         active_ = 0;
         auto done = std::exchange(complete_, {});
         if (done)
-            done(result, error);
+            done(error.isEmpty() ? result : failure, error);
     }
 }
 

@@ -268,9 +268,9 @@ class ImportWizard(QWidget):
         self.launch = button(tr("Открыть подтверждение и начать…"), self.telegram.confirm, primary=True)
         self.cancel = button(tr("Остановить"), self.telegram.cancel)
         self.diagnostic = button(tr("Диагностика операции…"), self.telegram.export_diagnostic)
-        self.repair_video = button(tr("Выбрать обработку видео…"), self.telegram.repair_video)
+        self.repair_media = button(tr("Выбрать обработку вложений"), self.telegram.repair_media)
         area.addLayout(bar(self.launch, self.cancel, self.diagnostic))
-        area.addWidget(self.repair_video, alignment=Qt.AlignmentFlag.AlignLeft)
+        area.addWidget(self.repair_media, alignment=Qt.AlignmentFlag.AlignLeft)
         area.addWidget(self.telegram.make_recovery_panel())
 
     def _verification(self, area):
@@ -568,8 +568,8 @@ class ImportWizard(QWidget):
         self.launch.setEnabled(self._ready_package() and telegram.start_button.isEnabled())
         self.cancel.setEnabled(telegram.busy)
         self.diagnostic.setEnabled(telegram.diagnostic_button.isEnabled())
-        self.repair_video.setVisible(not telegram.repair_video_button.isHidden())
-        self.repair_video.setEnabled(telegram.repair_video_button.isEnabled())
+        self.repair_media.setVisible(not telegram.repair_media_button.isHidden())
+        self.repair_media.setEnabled(telegram.repair_media_button.isEnabled())
         self.capture.setEnabled(self._package_active() and telegram.observe_button.isEnabled())
         self.historical.setEnabled(self._package_active() and telegram.historical_button.isEnabled())
         self.compare.setEnabled(self._package_active() and not busy)

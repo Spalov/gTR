@@ -1,5 +1,7 @@
 """Persistent owner session and one preflight/confirmation lease."""
 
+import sqlite3
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -134,7 +136,10 @@ class OwnerSession:
             result = await self.controller.execute(review.check, approved=True)
         finally:
             if self.controller.state == State.STAGED_NOT_STARTED and self.controller.job:
-                self.staged_jobs.append((self.controller.journal, self.controller.job))
+                journal, job = self.controller.journal, self.controller.job
+                self.staged_jobs.append((journal, job))
+                with suppress(OSError, sqlite3.Error):
+                    journal.owner_disconnected(job)
         return {**result, "operation_id": review.check.operation_id, "phase": "VERIFYING"}
 
     def discard(self):

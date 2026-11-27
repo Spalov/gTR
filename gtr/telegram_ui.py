@@ -42,9 +42,9 @@ from .conversion import load_bundle, prepare_eligible
 from .dashboard import label, number, panel, size_text
 from .faults import ImportFault
 from .i18n import tr
-from .journal import PHASE_NAMES, RecoveryRequired
-from .media_queue import video_decision_key
+from .journal import PHASE_NAMES, RecoveryRequired, State
 from .media_queue_ui import CompatibilityDialog
+from .media_recovery import SERVER_MEDIA_ERRORS, server_issue
 from .model import Cancelled, RecoveryError
 from .observation import CaptureWindow
 from .owner import api_vault_path, journal_for, vault_path
@@ -346,8 +346,8 @@ class TelegramControls(QObject):
         self.recovery_panel = self.make_recovery_panel()
         group.addWidget(self.recovery_panel)
         self.diagnostic_button = _button(tr("Сохранить диагностический отчёт…"), self.export_diagnostic)
-        self.repair_video_button = _button(tr("Выбрать обработку видео…"), self.repair_video)
-        group.addLayout(_row(self.diagnostic_button, self.repair_video_button))
+        self.repair_media_button = _button(tr("Выбрать обработку вложений"), self.repair_media)
+        group.addLayout(_row(self.diagnostic_button, self.repair_media_button))
         self.baseline_button = _button(tr("Сохранить границу до импорта…"), self.baseline)
         self.observe_button = _button(tr("Сохранить снимок…"), self.observe)
         self.historical_button = _button(tr("Снимок по датам…"), self.historical_observe)
@@ -590,38 +590,31 @@ class TelegramControls(QObject):
             tr("Подготовка новых записей"), job, self.window.use_recovery_bundle, project=project,
         )
 
-    def repair_video(self):
+    def offer_media_repair(self, issues, previous=None):
+        self.media_issues, self.media_repair_job = issues, previous
+        if issues:
+            self.state.setText(tr("Вложений, требующих обработки — {count}").format(count=number(len(issues))))
+        self.refresh()
+
+    def repair_media(self):
         bundle, project = self.package, self.project
-        if self.busy or self.closing or self.window.worker or not (bundle and project and self.failed_video):
+        if self.busy or self.closing or self.window.worker or not (bundle and project and self.media_issues):
             return
-        attempt = self.failed_video
-        entry = next((row for row in bundle.data["records"] if row.get("source_ordinal") == attempt.get("source_ordinal")), None)
-        if not entry:
-            self.info(tr("Откройте исходный проект и подготовьте пакет заново."))
-            return
-        video = entry.get("video_recovery", {})
-        original = next((asset for asset in entry.get("original_media", [])
-                         if asset["kind"] in {"video", "round_video"} and asset.get("sha256")), None)
-        if not original:
-            self.info(tr("Откройте исходный проект и подготовьте пакет заново."))
-            return
+        previous = self.media_repair_job
         tools = self.window.video_tools()
-        key = video.get("key") or video_decision_key(
-            bundle.data["source_sha256"], bundle.data["chat_id"], entry["source_ordinal"], original["sha256"],
-        )
-        repeat_safe = video.get("action") != "convert" or video.get("method") == "remux"
-        options = ("compatible", "document") if repeat_safe and tools.ffmpeg and tools.ffprobe else ("document",)
-        dialog = CompatibilityDialog(self.window, [{
-            "key": key, "group": "server_document", "name": original["original"],
-            "date": entry.get("original_date"), "size": original.get("size"), "source": original.get("path"),
-            "sha256": original["sha256"], "original": video.get("original") or {},
-            "options": options, "recommended": options[0],
-            "reason": "server_document" if repeat_safe else "server_document_copy",
-        }], project, tools)
+        dialog = CompatibilityDialog(self.window, self.media_issues, project, tools)
         accepted = dialog.exec() == QDialog.DialogCode.Accepted
         decisions = dialog.decisions() if accepted else None
         dialog.deleteLater()
         if decisions is None or self.package is not bundle:
+            return
+        if previous and QMessageBox.question(
+            self.window, tr("Подготовить новый пакет"),
+            tr("Предыдущая попытка будет закрыта в локальном журнале. Принятые Telegram вложения останутся "
+               "отмечены в отчёте. Для запуска нового импорта потребуется отдельное подтверждение."),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
             return
         dest = bundle.root.parent / f"gTR-media-fix-{uuid4().hex[:10]}"
         ranges = bundle.record_intervals()
@@ -629,17 +622,29 @@ class TelegramControls(QObject):
         account, target = self.account, self.target.currentData()
 
         def job(progress, **media):
-            return prepare_eligible(project, bundle, dest, ranges, progress, media_tools=tools, **media)
+            if previous:
+                journal, operation_id = previous
+                row = journal.operation(operation_id)
+                if (
+                    not row or row["state"] != State.STAGED_NOT_STARTED
+                    or row["manifest_sha256"] != bundle.manifest_hash()
+                    or row["start_request_sent"] is not False or row["start_request_accepted"] is not False
+                ):
+                    raise RecoveryError(tr("Состояние прошлых операций изменилось. Проверьте пакет заново."))
+                if row["stage"] != "recovered_before_start":
+                    journal.recover_before_start(operation_id, acknowledged=True)
+            return prepare_eligible(project, bundle, dest, ranges, progress, media_tools=tools, repair=True, **media)
 
         def ready(value):
             message = self.window.use_recovery_bundle(value)
             if self.account == account and self.target.currentData() == target:
                 self.bound_profile, self.test_reset_id = profile, test_reset_id
+            self.state.setText(tr("Пакет с исправленными вложениями готов. Проверьте его перед запуском."))
             self.refresh()
             return message
 
         self.window.run_recovery_media_job(
-            tr("Подготовка нового пакета после ответа Telegram"), job, ready, project=project, decisions=decisions,
+            tr("Подготовка исправленных вложений"), job, ready, project=project, decisions=decisions,
         )
 
     def refresh(self):
@@ -668,8 +673,8 @@ class TelegramControls(QObject):
         self.observe_button.setEnabled(observable)
         self.historical_button.setEnabled(observable)
         self.diagnostic_button.setEnabled(bool(enabled and self.operation_id))
-        self.repair_video_button.setVisible(bool(self.failed_video and self.package and self.project))
-        self.repair_video_button.setEnabled(bool(ready and self.failed_video))
+        self.repair_media_button.setVisible(bool(self.media_issues and self.package and self.project))
+        self.repair_media_button.setEnabled(bool(enabled and self.media_issues and self.package and self.project))
         name = self.account.name if connected else tr("Аккаунт отключён.")
         self.account_line.setText(name)
         if not connected:
@@ -830,7 +835,7 @@ class TelegramControls(QObject):
         self.transcript_uploaded = self.start_sent = self.start_accepted = False
         self.observed = self.verified = None
         self.operation_id = None
-        self.failed_video = None
+        self.media_issues, self.media_repair_job = [], None
 
     def set_package(self, bundle=None, project=None, source_path=""):
         self.bound_profile = None
@@ -1284,7 +1289,7 @@ class TelegramControls(QObject):
             return
         if name in {"import", "preflight"}:
             self.review = None
-            self.failed_video = None
+            self.media_issues, self.media_repair_job = [], None
         if name == "disconnect":
             self.account = self.review = None
             self.target.clear()
@@ -1309,10 +1314,17 @@ class TelegramControls(QObject):
                 state += " " + tr("Ожидание {seconds} с.").format(seconds=error.seconds)
             action = tr(details["action"], fallback=tr("Проверьте этап и состояние операции в журнале."))
             self.state.setText(f"{details['status_code']} · {state}")
+            self.media_issues = error.media_issues
             item = getattr(error, "media_attempt", None)
             if item:
-                if error.code == "MEDIA_TYPE_CHANGED" and item.get("source_ordinal") is not None:
-                    self.failed_video = item
+                if (
+                    name == "import" and error.code in SERVER_MEDIA_ERRORS and self.operation_id
+                    and self.package and self.account and self.target.currentData()
+                ):
+                    issue = server_issue(self.package, item, self.window.video_tools())
+                    if issue:
+                        self.media_issues = [issue]
+                        self.media_repair_job = (journal_for(self.account, self.target.currentData()), self.operation_id)
                 self.state.setText(tr('Ошибка на вложении {0} из {1} · {2}').format(item['index'], item['total'], error.code))
                 self.details.setText(
                     tr(

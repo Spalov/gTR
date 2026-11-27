@@ -151,12 +151,16 @@ QString optionName(const QString &option) {
         return B("Уменьшенная копия", "Зменшена копія");
     if (option == "document")
         return B("Документ", "Документ");
+    if (option == "image")
+        return B("Копия PNG", "Копія PNG");
+    if (option == "local")
+        return B("Только локально", "Лише локально");
     if (option == "skip")
-        return B("Оставить в архиве", "Залишити в архіві");
+        return B("Пропустить вложение", "Пропустити вкладення");
     return B("Оригинал", "Оригінал");
 }
 
-QString videoReason(const QString &code) {
+QString mediaReason(const QString &code) {
     if (code == "alpha_requires_original")
         return B("Видео с прозрачностью", "Відео з прозорістю");
     if (code == "ffmpeg_unavailable" || code == "ffprobe_unavailable")
@@ -167,7 +171,49 @@ QString videoReason(const QString &code) {
         return B("Требуется совместимая копия", "Потрібна сумісна копія");
     if (code == "disk_space")
         return B("Мало места на диске", "Мало місця на диску");
+    if (code == "webp_photo")
+        return B("Для WebP нужна совместимая копия", "Для WebP потрібна сумісна копія");
+    if (code == "sticker_unconfirmed")
+        return B("Формат стикера не подтверждён", "Формат стікера не підтверджено");
+    if (code == "sticker_legacy_document")
+        return B("Стикер был подготовлен как документ", "Стікер був підготовлений як документ");
+    if (code == "attachment_format" || code == "corrupt_container" || code == "audio_unreadable")
+        return B("Файл не прошёл проверку формата", "Файл не пройшов перевірку формату");
+    if (code == "audio_unconfirmed")
+        return B("Тип или длительность аудио не подтверждены", "Тип або тривалість аудіо не підтверджено");
+    if (code == "multiple_attachments")
+        return B("Несколько файлов в одной записи", "Кілька файлів в одному записі");
+    if (code == "image_copy_failed")
+        return B("Не удалось создать PNG", "Не вдалося створити PNG");
     return B("Нужно выбрать способ подготовки", "Потрібно вибрати спосіб підготовки");
+}
+
+QString mediaKind(const QString &code) {
+    if (code == "webp_sticker")
+        return B("Стикер WebP", "Стікер WebP");
+    if (code == "tgs_sticker")
+        return B("Стикер TGS", "Стікер TGS");
+    if (code == "webm_sticker")
+        return B("Стикер WebM", "Стікер WebM");
+    if (code == "sticker")
+        return B("Стикер", "Стікер");
+    if (code == "webp_image")
+        return B("Изображение WebP", "Зображення WebP");
+    if (code == "photo")
+        return B("Фото", "Фото");
+    if (code == "round_video")
+        return B("Кружок", "Відеокружечок");
+    if (code == "video")
+        return B("Видео", "Відео");
+    if (code == "animation")
+        return B("Анимация", "Анімація");
+    if (code == "voice")
+        return B("Голосовое", "Голосове");
+    if (code == "audio")
+        return B("Аудио", "Аудіо");
+    if (code == "document")
+        return B("Документ", "Документ");
+    return QStringLiteral("—");
 }
 
 QString operationState(const QString &code) {
@@ -539,13 +585,34 @@ QWidget *Window::recoveryPage() {
         connect(control, &QComboBox::currentIndexChanged, this, invalidates);
 
     issues_ = new QTableWidget;
-    issues_->setColumnCount(2);
-    issues_->setHorizontalHeaderLabels({B("Вложение", "Вкладення"), B("Что сделать", "Що зробити")});
+    issues_->setColumnCount(4);
+    issues_->setHorizontalHeaderLabels({B("Вложение", "Вкладення"), B("Типы", "Типи"),
+                                        B("Причина", "Причина"), B("Что сделать", "Що зробити")});
     issues_->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
     issues_->verticalHeader()->hide();
     issues_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    issues_->setSelectionBehavior(QAbstractItemView::SelectRows);
     issues_->hide();
     analysis->addWidget(issues_, 1);
+    applyMediaGroup_ = button(B("Применить к аналогичным файлам", "Застосувати до подібних файлів"), this, [this] {
+        const int selected = issues_->currentRow();
+        if (selected < 0)
+            return;
+        const auto group = issues_->item(selected, 0)->data(Qt::UserRole);
+        const auto *source = qobject_cast<QComboBox *>(issues_->cellWidget(selected, 3));
+        const auto action = source->currentData();
+        if (action.toString().isEmpty())
+            return;
+        for (int row = 0; row < issues_->rowCount(); ++row)
+            if (issues_->item(row, 0)->data(Qt::UserRole) == group) {
+                auto *choice = qobject_cast<QComboBox *>(issues_->cellWidget(row, 3));
+                const int option = choice->findData(action);
+                if (option >= 0)
+                    choice->setCurrentIndex(option);
+            }
+    });
+    applyMediaGroup_->hide();
+    analysis->addWidget(applyMediaGroup_, 0, Qt::AlignLeft);
     analysis->addWidget(button(B("Проверить выбранные параметры", "Перевірити вибрані параметри"), this,
                                 [this] { plan(); }), 0, Qt::AlignLeft);
     wizard_->addWidget(analysis->parentWidget());
@@ -959,17 +1026,27 @@ void Window::setPlan(const QJsonObject &value) {
     analysis_->setText(report);
     issues_->setRowCount(0);
     issues_->setVisible(!entries.isEmpty());
+    applyMediaGroup_->setVisible(entries.size() > 1);
     for (const auto &issue : entries) {
         const auto entry = issue.toObject();
         const auto index = issues_->rowCount();
         issues_->insertRow(index);
         issues_->setItem(index, 0, new QTableWidgetItem(entry["name"].toString()));
-        issues_->item(index, 0)->setToolTip(videoReason(entry["reason"].toString()));
+        issues_->item(index, 0)->setData(Qt::UserRole, entry["group"].toString());
+        const auto types = B("Архив · %1\nПакет · %2\nTelegram · %3", "Архів · %1\nПакет · %2\nTelegram · %3")
+            .arg(mediaKind(entry["source_kind"].toString()), mediaKind(entry["prepared_kind"].toString()),
+                 mediaKind(entry["received_kind"].toString()));
+        issues_->setItem(index, 1, new QTableWidgetItem(types));
+        const auto reason = mediaReason(entry["reason"].toString());
+        issues_->setItem(index, 2, new QTableWidgetItem(reason));
+        issues_->item(index, 2)->setToolTip(reason);
         auto *choice = new QComboBox;
         choice->addItem(B("Выберите действие", "Виберіть дію"), QString());
         for (const auto &option : entry["options"].toArray())
             choice->addItem(optionName(option.toString()), option.toString());
         const auto key = entry["key"].toString();
+        if (const auto recommendation = entry["recommended"].toString(); !recommendation.isEmpty())
+            choice->setToolTip(B("Рекомендуется %1", "Рекомендовано %1").arg(optionName(recommendation)));
         connect(choice, &QComboBox::currentIndexChanged, this, [this, key, choice] {
             const auto action = choice->currentData().toString();
             if (action.isEmpty())
@@ -977,8 +1054,9 @@ void Window::setPlan(const QJsonObject &value) {
             else
                 decisions_[key] = action;
         });
-        issues_->setCellWidget(index, 1, choice);
+        issues_->setCellWidget(index, 3, choice);
     }
+    issues_->resizeRowsToContents();
     if (currentStep_ == Analysis)
         continue_->setEnabled(waiting == 0 && totals["included"].toInteger() > 0);
 }
@@ -1128,6 +1206,13 @@ void Window::task(const QString &name, const QString &method, const QJsonObject 
         if (error.isEmpty()) {
             status(B("Готово", "Готово"));
             done(value);
+        } else if (error == "MEDIA_DECISION_REQUIRED" && wizard_ && !plan_.isEmpty()) {
+            auto revised = plan_;
+            revised["decisions"] = value["decisions"];
+            revised["decisions_total"] = value["decisions_total"];
+            step(Analysis);
+            setPlan(revised);
+            status(fault(error));
         } else {
             status(fault(error));
         }

@@ -1,8 +1,6 @@
-![gTR — Gruzin’s Telegram Recovery](https://raw.githubusercontent.com/Spalov/gTR/main/docs/assets/gtr-banner.png)
-
 # gTR
 
-**Beta 6 · Грузин (Gruzin) · Windows 10/11 x64**
+**Beta 6 (Fix) · Грузин (Gruzin) · Windows 10/11 x64**
 
 gTR — неофициальное приложение, которое использует Telegram API. Оно открывает экспорты Telegram Desktop, сохраняет доступную историю и вложения в отдельном проекте, готовит пакеты History Import и сверяет результат. Просмотр, подготовка и имитация работают без подключения к Telegram.
 

@@ -830,6 +830,7 @@ def recover_package(journal, job, progress=quiet):
                 annotation_language=data.get("annotation_language", "ru"),
                 record_kind=selection.get("record_kind", "all"),
                 binding_version=data.get("binding_version", 0),
+                media_workflow=bool(data.get("media_workflow")),
             )
             if built.manifest_hash() != sha or check_local(built, project, progress)["status"] != "verified":
                 raise RecoveryError("Пересобранный пакет отличается от сохранённого манифеста.")

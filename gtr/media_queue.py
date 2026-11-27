@@ -15,7 +15,7 @@ from time import monotonic, sleep
 from .files import BLOCK, digest, local, private_directory
 from .model import RecoveryError
 
-DECISIONS = {"compatible", "original", "document", "skip", "reencode", "remux", "fidelity", "compact"}
+DECISIONS = {"compatible", "original", "document", "skip", "local", "image", "reencode", "remux", "fidelity", "compact"}
 CACHE_PROFILE = "mp4-h264-aac-remux-crf18-autorotate-sar-v1"
 CACHE_KEY = re.compile(r"[a-f0-9]{64}")
 CACHE_TEMP = ".gtr-media-"
@@ -27,7 +27,7 @@ MIN_FREE = 32 * 1024**2
 class MediaDecisionRequired(RecoveryError):
     def __init__(self, entries):
         self.entries = entries
-        super().__init__(f"Для {len(entries)} видео выберите совместимую копию, документ или пропуск.")
+        super().__init__(f"Выберите обработку для проблемных вложений ({len(entries)}).")
 
 
 class MediaDiskSpace(RecoveryError):

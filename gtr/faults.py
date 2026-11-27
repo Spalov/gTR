@@ -185,6 +185,7 @@ class ImportFault(RecoveryError):
         self.retry = retry or self.policy.retry
         self.response_constructor = response_constructor
         self.media_attempt: dict | None = None
+        self.media_issues: list[dict] = []
         self.operation_id: str | None = None
         super().__init__(self.policy.message + (f" Ожидание {seconds} с." if seconds else ""))
 
@@ -216,4 +217,6 @@ class ImportFault(RecoveryError):
             from .journal import redact_attempt
 
             result["media_attempt"] = self.media_attempt if private else redact_attempt(self.media_attempt)
+        if self.media_issues:
+            result["media_issue_count"] = len(self.media_issues)
         return result

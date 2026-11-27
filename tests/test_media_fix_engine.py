@@ -110,7 +110,7 @@ def test_missing_ffmpeg_offers_document_without_silent_fallback(tmp_path, five_c
         prepare(project, 1, tmp_path / "missing", video_policy="compatible", media_tools=tools)
     assert len(blocked.value.entries) == 5
     assert all(entry["reason"] == "ffmpeg_unavailable" for entry in blocked.value.entries)
-    assert all(entry["options"] == ("document", "skip") for entry in blocked.value.entries)
+    assert all(entry["options"] == ("document", "local", "skip") for entry in blocked.value.entries)
     choices = {entry["key"]: "document" for entry in blocked.value.entries}
     bundle = prepare(project, 1, tmp_path / "document", video_policy="compatible", media_tools=tools,
                      video_decisions=choices)

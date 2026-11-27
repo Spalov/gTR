@@ -79,7 +79,7 @@ def test_beta5_detects_video_needing_a_decision_without_publishing(tmp_path, med
     assert records[5]["video_recovery"]["original"]["status"] in {"corrupt_container", "probe_failed"}
     assert records[6]["included"] and not records[6].get("media")
     dest = tmp_path / "blocked"
-    with pytest.raises(RecoveryError, match="выберите совместимую копию"):
+    with pytest.raises(RecoveryError, match="Выберите обработку для проблемных вложений"):
         prepare(project, 1, dest, **opts)
     assert not dest.exists()
 

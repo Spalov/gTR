@@ -166,6 +166,14 @@ def chat_page(params, progress):
             "before": rows[limit - 1]["id"] if len(rows) > limit else None}
 
 
+def media_choices(entries):
+    keys = ("key", "group", "name", "source_kind", "prepared_kind", "received_kind", "reason", "recommended", "options")
+    return {
+        "decisions": [{key: entry[key] for key in keys if key in entry} for entry in entries[:300]],
+        "decisions_total": len(entries),
+    }
+
+
 def recovery(params, progress, *, build=False):
     project = request_path(params["project"])
     chat = params["chat"]
@@ -193,7 +201,7 @@ def recovery(params, progress, *, build=False):
         return {"path": str(bundle.root), "summary": plan_summary(bundle.data)}
     plan = plan_import(project, chat, "source", progress, **options)
     pending = plan.get("media_decisions_required", [])
-    return {"summary": plan_summary(plan), "decisions": pending[:30], "decisions_total": len(pending)}
+    return {"summary": plan_summary(plan), **media_choices(pending)}
 
 
 def prepare_recovery(params, progress):
@@ -392,7 +400,8 @@ class Service:
         except AttachmentBindingError:
             self.send(request, error={"code": "UNRESOLVED_ATTACHMENT"})
         except MediaDecisionRequired as error:
-            self.send(request, error={"code": "MEDIA_DECISION_REQUIRED", "count": len(error.entries)})
+            self.send(request, error={"code": "MEDIA_DECISION_REQUIRED", "count": len(error.entries),
+                                      **media_choices(error.entries)})
         except MediaDiskSpace:
             self.send(request, error={"code": "DISK_SPACE"})
         except MemoryError:

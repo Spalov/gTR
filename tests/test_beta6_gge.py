@@ -53,7 +53,7 @@ def test_webm_alpha_disallows_implicit_loss_and_sticker_is_distinct():
     class Tools:
         ffmpeg = ffprobe = True
 
-    assert video_options(evidence, {"kind": "video"}, Tools()) == ("document", "skip")
+    assert video_options(evidence, {"kind": "video"}, Tools()) == ("document", "local", "skip")
     assert not VideoEvidence("unknown").alpha
 
 

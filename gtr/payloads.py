@@ -220,7 +220,7 @@ def _attribute_shape(details):
         case "animation":
             return True
         case "sticker":
-            return isinstance(emoji := details.get("emoji"), str) and 0 < len(emoji) <= 80
+            return isinstance(emoji := details.get("emoji"), str) and len(emoji) <= 80
         case _:
             return not details
 
@@ -258,6 +258,8 @@ def validate_media_input(item, path, *, strict=False):
         if item.get("representation") != representation:
             raise ValueError
     if "force_file" in item and type(item["force_file"]) is not bool:
+        raise ValueError
+    if item.get("force_file") and (attrs or upload_as == "photo"):
         raise ValueError
     claimed = item.get("detected_mime") if strict else ""
     if claimed or attrs or upload_as == "photo":

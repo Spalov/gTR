@@ -123,6 +123,7 @@ def app_files():
                 "BENCHMARKS.md",
                 "BETA_6_TEST_PLAN.md",
                 "GGE_PROVENANCE.md",
+                "BETA_6_FIX_MEDIA.md",
             )
         ),
     ]

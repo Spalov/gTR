@@ -1,4 +1,4 @@
-"""Local review and preview for videos requiring an explicit decision."""
+"""Local review and preview for attachments requiring an explicit decision."""
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QPixmap
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 
 from .files import local, safe_parts
 from .i18n import tr
+from .media import KIND_NAMES
 from .media_preview import FFmpegThumbnail, preview
 from .model import RecoveryError
 
@@ -23,6 +24,11 @@ ACTION = {
     "compatible": "Создать совместимую копию",
     "original": "Использовать оригинал",
     "document": "Отправить как документ",
+    "image": "Создать совместимое изображение PNG",
+    "local": "Оставить только локально",
+    "remux": "Сменить контейнер без перекодирования",
+    "fidelity": "Создать копию с максимальной точностью",
+    "compact": "Создать уменьшенную копию",
     "skip": "Пропустить вложение",
 }
 REASON = {
@@ -44,8 +50,21 @@ REASON = {
     "conversion_failed": "Не удалось создать совместимую копию",
     "disk_space": "Недостаточно места для совместимой копии",
     "multiple_attachments": "Видео входит в группу вложений",
-    "server_document": "Telegram вернул документ вместо видео",
-    "server_document_copy": "Telegram вернул документ для уже обработанной копии",
+    "sticker_legacy_document": "Предыдущая версия подготовила стикер как документ",
+    "sticker_unconfirmed": "Содержимое файла не подтверждает допустимый формат стикера",
+    "webp_photo": "Для отправки WebP как изображения нужна копия в поддерживаемом формате",
+    "attachment_format": "Содержимое файла не соответствует подготовленному типу",
+    "attachment_unconfirmed": "Не удалось подтвердить тип или метаданные вложения",
+    "audio_unconfirmed": "Не удалось подтвердить тип или длительность аудио",
+    "audio_unreadable": "Аудиофайл недоступен или повреждён",
+    "image_copy_failed": "Не удалось создать PNG с сохранением изображения",
+    "MEDIA_INVALID": "Telegram отклонил подготовленный тип вложения",
+    "MEDIA_TYPE_CHANGED": "Telegram вернул тип, отличный от подготовленного",
+}
+MEDIA_TYPES = {
+    **KIND_NAMES, "webp_sticker": "Статический стикер WebP", "tgs_sticker": "Анимированный стикер TGS",
+    "webm_sticker": "Видеостикер WebM", "webp_image": "Изображение WebP",
+    "custom_emoji": "Пользовательский эмодзи", "unsupported": "Неподдерживаемое вложение",
 }
 QUEUE_STAGES = {
     "analysis": "Анализ медиа",
@@ -107,7 +126,8 @@ class PreviewWorker(QThread):
     def run(self):
         try:
             path = local(self.project / "source" / "/".join(safe_parts(self.entry["source"])))
-            _, image = preview(path, self.entry.get("sha256"), provider=FFmpegThumbnail(self.ffmpeg))
+            provider = FFmpegThumbnail(self.ffmpeg) if self.ffmpeg else None
+            _, image = preview(path, self.entry.get("sha256"), provider=provider)
             self.picture.emit(image)
         except (OSError, RecoveryError, ValueError):
             self.picture.emit(None)
@@ -127,12 +147,13 @@ class CompatibilityDialog(QDialog):
         layout.addWidget(intro)
         self.table = QTableWidget(len(entries), 7)
         self.table.setHorizontalHeaderLabels([tr(x) for x in (
-            "Оригинальное имя", "Дата", "Размер", "Длительность", "Разрешение", "Причина и формат", "Решение",
+            "Оригинальное имя", "Исходный тип", "Подготовленный тип", "Ответ Telegram",
+            "Причина", "Рекомендация", "Решение",
         )])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         layout.addWidget(self.table, 1)
         for row, entry in enumerate(entries):
@@ -148,7 +169,9 @@ class CompatibilityDialog(QDialog):
             reminder = QLabel(tr("Сохранённые решения подставлены. Проверьте их и подтвердите продолжение."))
             reminder.setWordWrap(True)
             layout.addWidget(reminder)
-        if not tools.ffprobe or not tools.ffmpeg:
+        if (not tools.ffprobe or not tools.ffmpeg) and any(
+            entry.get("source_kind") in {"video", "round_video", "webm_sticker"} for entry in entries
+        ):
             help_line = QLabel(tr(TOOL_HELP))
             help_line.setWordWrap(True)
             layout.addWidget(help_line)
@@ -181,18 +204,16 @@ class CompatibilityDialog(QDialog):
         self.refresh()
 
     def add_entry(self, row, entry):
-        original = entry.get("original") or {}
-        width, height = original.get("width"), original.get("height")
-        duration = original.get("duration")
-        format_text = " · ".join(str(v) for v in (original.get("container"), original.get("codec")) if v)
-        cause = tr(REASON.get(entry.get("reason"), REASON["transcode_required"]))
+        cause = tr(REASON.get(entry.get("reason"), REASON["attachment_unconfirmed"]))
         values = (
-            entry["name"], entry.get("date") or "—", media_size(entry.get("size") or 0),
-            tr("{seconds} с").format(seconds=f"{duration:g}") if duration else "—",
-            f"{width} × {height}" if width and height else "—", f"{cause} · {format_text}" if format_text else cause,
+            entry["name"], *(tr(MEDIA_TYPES.get(entry.get(key), "—")) for key in (
+                "source_kind", "prepared_kind", "received_kind",
+            )), cause, tr(ACTION.get(entry.get("recommended"), "—")),
         )
         for column, value in enumerate(values):
-            self.table.setItem(row, column, QTableWidgetItem(str(value)))
+            cell = QTableWidgetItem(str(value))
+            cell.setToolTip(str(value))
+            self.table.setItem(row, column, cell)
         combo = QComboBox()
         combo.addItem(tr("Выберите действие"), None)
         for action in entry["options"]:
@@ -209,8 +230,15 @@ class CompatibilityDialog(QDialog):
         selected = row >= 0
         if selected:
             entry = self.entries[row]
-            action = entry.get("recommended")
-            self.details.setText(tr("Рекомендуется: {action}").format(action=tr(ACTION[action])) if action else "")
+            original = entry.get("original") or {}
+            width, height = original.get("width"), original.get("height")
+            duration = original.get("duration")
+            fields = (
+                entry.get("date"), media_size(entry.get("size") or 0), original.get("container"), original.get("codec"),
+                tr("{seconds} с").format(seconds=f"{duration:g}") if duration else None,
+                f"{width} × {height}" if width and height else None,
+            )
+            self.details.setText(" · ".join(value for value in fields if value))
         self.apply_button.setEnabled(all(self.decisions().values()))
         self.batch_button.setEnabled(
             any(choice.findData("compatible") >= 0 for choice in self.choices)
@@ -218,7 +246,7 @@ class CompatibilityDialog(QDialog):
         )
         self.group_button.setEnabled(selected and bool(self.choices[row].currentData()))
         self.preview_button.setEnabled(bool(
-            selected and self.project and self.tools.ffmpeg and self.entries[row].get("source") and not self.preview_job
+            selected and self.project and self.entries[row].get("source") and not self.preview_job
         ))
 
     def apply_group(self):

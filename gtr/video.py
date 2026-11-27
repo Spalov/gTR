@@ -12,10 +12,12 @@ from threading import BoundedSemaphore, Thread
 from time import monotonic
 from uuid import uuid4
 
+from .bindings import requested_kind
 from .files import digest, local
 from .gge_process import CREATE_SUSPENDED, resume_worker, tool_environment
 from .media_engine import MalformedMedia, _box_headers, inspect
 from .media_queue import MIN_FREE, MediaDiskSpace
+from .media_recovery import observed_media_kind  # noqa: F401 - retained for existing callers
 from .model import Cancelled, RecoveryError, quiet
 from .structure import unicode_text
 
@@ -446,7 +448,7 @@ class MediaTools:
 def video_representation(item, decision):
     """Apply the recorded preparation decision to a source-bound candidate."""
     action = decision["action"]
-    if action in {"skip", "blocked"}:
+    if action in {"skip", "local", "blocked"}:
         return None
     item = dict(item)
     output = decision.get("output")
@@ -501,7 +503,7 @@ def video_options(original, item, tools):
             actions.append("remux")
     if original.status not in {"missing", "empty", "size_mismatch", "hash_mismatch", "changed", "unreadable"}:
         actions.append("document")
-    actions.append("skip")
+    actions.extend(("local", "skip"))
     return tuple(actions)
 
 
@@ -540,38 +542,18 @@ def queue_video(item, path, policy, tools, progress, work, queue, entry, explici
     if record["action"] == "blocked":
         group = ":".join(str(value or "-") for value in (problem, item["kind"], original.container, original.codec, *options))
         entry.update(group=group, original=original.summary(), options=options, reason=problem,
+                     source_kind=item["kind"], prepared_kind=requested_kind(item),
                      recommended="compatible" if "compatible" in options and problem != "conversion_failed"
-                     else "document" if "document" in options else "skip")
+                     else "document" if "document" in options else "local")
         queue.finish(entry)
     else:
         queue.finish()
     return video_representation(item, record), record
 
 
-def observed_media_kind(media):
-    name = type(media).__name__
-    if name == "MessageMediaPhoto":
-        return "photo"
-    if name != "MessageMediaDocument":
-        return None
-    attributes = {
-        type(attribute).__name__: attribute
-        for attribute in getattr(getattr(media, "document", None), "attributes", ())
-    }
-    if "DocumentAttributeSticker" in attributes:
-        return "sticker"
-    if "DocumentAttributeAnimated" in attributes:
-        return "animation"
-    if video := attributes.get("DocumentAttributeVideo"):
-        return "round_video" if getattr(video, "round_message", False) else "video"
-    if audio := attributes.get("DocumentAttributeAudio"):
-        return "voice" if getattr(audio, "voice", False) else "audio"
-    return "document"
-
-
 def gge_probe(path, kind, progress=quiet):
     """Call the optional GGE/PyAV helper under the same limits as local tools."""
-    if find_spec("av" if kind != "image" else "PIL") is None:
+    if find_spec("PIL" if kind in {"image", "image-copy"} else "av") is None:
         return None
     executable = local(Path(sys.executable))
     return _run(executable, ["-X", "utf8", "-m", "gtr.gge_video", kind, str(path)], 16, progress,

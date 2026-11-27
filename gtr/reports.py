@@ -140,6 +140,9 @@ def plan_summary(data):
         "albums": data.get("album_count"),
         "missing_assets": sum(a["status"] in {"missing", "empty"} for r in records for a in r.get("original_media", [])),
         "video_actions": dict(statuses),
+        "attachment_actions": dict(Counter(
+            r["media_recovery"]["action"] for r in records if r.get("media_recovery")
+        )),
         "video_incompatible": sum(
             r.get("video_recovery", {}).get("original", {}).get("status") not in {None, "compatible"}
             for r in records
@@ -275,7 +278,7 @@ def project_html(report):
 
 VIDEO_ACTIONS = {
     "blocked": "Требуется решение", "keep": "Оригинал", "convert": "Совместимая копия",
-    "document": "Документ", "skip": "Пропуск",
+    "document": "Документ", "skip": "Пропуск", "local": "Только локально",
 }
 VIDEO_RESULTS = {
     "compatible": "Параметры подходят", "transcode_required": "Нужна совместимая копия",
@@ -307,6 +310,24 @@ def _video_html(records):
         ("ID", "Контейнер", "Видео", "Аудио", "Секунды", "Размер", "Кадры/с", "Поворот",
          "Потоковое", "Проверка", "Решение", "Подготовленный кодек", "SHA-256 исходника", "SHA-256 копии"),
         rows,
+    ) if rows else ""
+
+
+def _attachment_recovery_html(records):
+    actions = {
+        **VIDEO_ACTIONS, "sticker": "Исходный стикер", "image": "Совместимое изображение PNG",
+    }
+    types = {
+        **KIND_NAMES, "webp_sticker": "Стикер WebP", "tgs_sticker": "Стикер TGS",
+        "webm_sticker": "Стикер WebM", "webp_image": "Изображение WebP",
+    }
+    rows = [
+        (record["source_ordinal"], types.get(decision.get("source_kind")), actions.get(decision["action"]),
+         decision.get("original_sha256"), decision.get("sha256"))
+        for record in records if (decision := record.get("media_recovery"))
+    ]
+    return "<h2>Решения по вложениям</h2>" + _table(
+        ("Запись", "Исходный тип", "Обработка", "SHA-256 оригинала", "SHA-256 копии"), rows,
     ) if rows else ""
 
 
@@ -384,6 +405,7 @@ def package_html(data, *, planned=False):
                 ],
             ),
             _video_html(data["records"]),
+            _attachment_recovery_html(data["records"]),
             "<h2>Ограничения и пропуски</h2>",
             _table(("Наблюдение", "Записи"), [(LOSS.get(k, k), v) for k, v in stats["losses"].items()]),
             "<h2>Записи с потерями</h2>",

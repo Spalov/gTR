@@ -126,18 +126,19 @@ def inspect(path, *, member=None, poster=False):
         return details
 
 
-def image_preview(source, max_side=480):
-    """GGE image resizing and orientation, with alpha preserved in PNG."""
+def _image_png(source, max_side=None):
+    """GGE orientation and PNG encoding with the original alpha channel."""
     from PIL import Image, ImageOps
 
-    if not 64 <= max_side <= 1024:
-        raise ValueError("preview_dimensions")
     with Image.open(source, formats=("JPEG", "PNG", "WEBP", "GIF")) as picture:
         if not 0 < picture.width * picture.height <= PIXEL_LIMIT:
             raise ValueError("pixel_budget")
-        if picture.format == "JPEG":
-            picture.draft("RGB", (max_side, max_side))
-        picture.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        if max_side:
+            if picture.format == "JPEG":
+                picture.draft("RGB", (max_side, max_side))
+            picture.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        elif picture.format != "WEBP" or getattr(picture, "is_animated", False):
+            raise ValueError("unsupported_recovery_image")
         prepared = ImageOps.exif_transpose(picture)
         output = io.BytesIO()
         prepared.convert("RGBA" if "A" in prepared.getbands() or "transparency" in prepared.info else "RGB").save(
@@ -148,11 +149,17 @@ def image_preview(source, max_side=480):
         return output.getvalue()
 
 
+def image_preview(source, max_side=480):
+    if not 64 <= max_side <= 1024:
+        raise ValueError("preview_dimensions")
+    return _image_png(source, max_side)
+
+
 if __name__ == "__main__":
     kind, filename = sys.argv[1:3]
-    if kind == "image":
+    if kind in {"image", "image-copy"}:
         with media_source(Path(filename), budget=40 * 1024**2) as stream:
-            sys.stdout.buffer.write(image_preview(stream))
+            sys.stdout.buffer.write(image_preview(stream) if kind == "image" else _image_png(stream))
     elif kind == "poster":
         sys.stdout.buffer.write(inspect(Path(filename), poster=True))
     elif kind == "probe":

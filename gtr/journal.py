@@ -976,14 +976,15 @@ class Journal:
             )
         with self.connect(lock=True) as db:
             row = db.execute(
-                """SELECT o.stage,o.state,w.pid,w.process_started_at,w.disconnected_at FROM operations o
+                """SELECT o.stage,o.state,o.start_request_sent,o.start_request_accepted,
+                   w.pid,w.process_started_at,w.disconnected_at FROM operations o
                 JOIN destination_locks l ON l.operation=o.id JOIN operation_workers w ON w.operation=o.id
                 WHERE o.id=? AND o.mode='owner'""",
                 (job,),
             ).fetchone()
             if not row or row["stage"] not in PRE_START_STAGES or row["state"] not in PRE_START_STATES:
                 raise RecoveryError("Эта операция не подходит для локального восстановления до запуска.")
-            if self._has_start_boundary(db, job):
+            if row["start_request_sent"] != 0 or row["start_request_accepted"] != 0 or self._has_start_boundary(db, job):
                 raise RecoveryError("Финальный запрос мог быть отправлен. Нужна сверка истории.")
             if not worker_stopped(row):
                 raise RecoveryError("Процесс операции ещё работает или его завершение не подтверждено.")

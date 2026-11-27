@@ -9,8 +9,8 @@ from pathlib import Path
 from .bindings import digest_text, literal_marker, wire_name
 from .faults import ImportFault
 from .files import local, publish_text, read_json
+from .media_recovery import observed_media_kind
 from .model import RecoveryError, quiet
-from .video import observed_media_kind
 
 MAX_SCAN = 20_000
 MAX_MEDIA_HASH = 128 * 1024**2

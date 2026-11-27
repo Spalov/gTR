@@ -28,6 +28,7 @@ from .conversion import prepare
 from .core import catalogue, properties
 from .dashboard import label
 from .files import local, publish_text
+from .i18n import tr
 from .incremental_import import (
     STATUS_NAMES,
     VERIFY_PREVIOUS_OPERATIONS,
@@ -38,7 +39,9 @@ from .incremental_import import (
     save_verification_preference,
 )
 from .integrity import check_local
-from .journal import PHASE_NAMES, Endpoint, Journal
+from .journal import PHASE_NAMES, Endpoint, Journal, State
+from .media_engine import inspect_bundle
+from .media_recovery import SERVER_MEDIA_ERRORS, bundle_issues, server_issue
 from .model import RecoveryError
 from .owner import app_home
 from .wizard import bar, button
@@ -512,6 +515,7 @@ class HistoryPage(QWidget):
             bar(
                 button("Просмотреть записи", lambda: self.action("records")),
                 button("Экспортировать диагностику", lambda: self.action("export")),
+                button(tr("Выбрать обработку вложений"), lambda: self.action("media")),
             )
         )
         self.rows = self.visible_rows = []
@@ -560,6 +564,52 @@ class HistoryPage(QWidget):
             f"Состояние неизвестно {sum(r['status'] == 'UNKNOWN_SERVER_STATE' for r in self.visible_rows)}"
         )
 
+    def open_media_repair(self, journal, row):
+        current_project = self.window.project
+        tools = self.window.video_tools()
+        job_id = row["id"]
+
+        def load(progress):
+            report = journal.diagnostic_report(job_id, private=True)
+            operation = report["operation"]
+            if (
+                operation["state"] != State.STAGED_NOT_STARTED
+                or operation["start_request_sent"] is not False or operation["start_request_accepted"] is not False
+            ):
+                raise RecoveryError(tr("Эта операция не подходит для локального восстановления до запуска."))
+            attempt = next(
+                (attempt for attempt in reversed(report["media_attempts"]) if attempt["error_code"] in SERVER_MEDIA_ERRORS),
+                None,
+            )
+            if not attempt:
+                raise RecoveryError(tr("В операции нет отклонённого Telegram вложения."))
+            bundle = recover_package(journal, job_id, progress)
+            issue = server_issue(bundle, attempt, tools)
+            if not issue:
+                raise RecoveryError(tr("Не удалось сопоставить вложение с сохранённым пакетом."))
+            inventory = inspect_bundle(bundle, progress, hash_verified=True)
+            issues = [issue, *(candidate for candidate in bundle_issues(bundle, inventory) if candidate["key"] != issue["key"])]
+            project = Path(row["project"]) if row["project"] else current_project
+            if not project or not (project / "history.sqlite").is_file():
+                raise RecoveryError(tr("Откройте исходный проект этого пакета."))
+            return bundle, project, issues
+
+        def ready(value):
+            bundle, project, issues = value
+            if self.window.project != project:
+                self.window.bind_project(project)
+            self.window.use_bundle(bundle)
+            controls = self.window.telegram
+            controls.bound_profile = (row["account"], row["peer"])
+            controls.test_reset_id = row["test_reset_id"]
+            controls.operation_id = job_id
+            self.window.navigate_to(5)
+            self.window.import_tabs.setCurrentWidget(controls.server_page)
+            controls.offer_media_repair(issues, (journal, job_id))
+            return controls.state.text()
+
+        return self.window.run_job(tr("Проверка сохранённых вложений"), load, ready)
+
     def action(self, action):
         i = self.table.currentRow()
         if i < 0:
@@ -568,6 +618,8 @@ class HistoryPage(QWidget):
         journal = Journal(app_home() / "imports.sqlite", Endpoint(row["peer"], row["account"]))
         if action == "continue":
             return self.window.show_import_profiles((row["account"], row["peer"]))
+        if action == "media":
+            return self.open_media_repair(journal, row)
         if action == "verify":
 
             def ready(bundle):

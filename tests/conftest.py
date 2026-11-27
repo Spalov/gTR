@@ -76,6 +76,10 @@ def synthetic(tmp_path):
     picture.fill(0xFF406080)
     buffer = QBuffer()
     assert buffer.open(QIODevice.OpenModeFlag.WriteOnly) and picture.save(buffer, "JPEG")
+    sticker = QImage(512, 256, QImage.Format.Format_RGBA8888)
+    sticker.fill(0x80C06040)
+    webp = QBuffer()
+    assert webp.open(QIODevice.OpenModeFlag.WriteOnly) and sticker.save(webp, "WEBP", 100)
     root = tmp_path / "export"
     rows = [
         message(1, ["До ", {"type": "bold", "text": "встречи 👋"}, "\nв 12:00."]),
@@ -95,7 +99,7 @@ def synthetic(tmp_path):
         ("video_file", "file", "v.mp4", b"\0\0\0\x18ftypisom000"),
         ("video_message", "file", "r.mp4", b"\0\0\0\x18ftypisom001"),
         ("voice_message", "file", "v.ogg", b"OggSdata"),
-        ("sticker", "file", "s.webp", b"RIFF0123WEBPVP8L"),
+        ("sticker", "file", "s.webp", bytes(webp.data())),
         (
             "animation",
             "file",
@@ -118,6 +122,7 @@ def synthetic(tmp_path):
                 "Подпись" if sid == 3 else "",
                 media_type=kind,
                 **{field: "files/" + filename, "file_size": len(data), "photo_file_size": len(data)},
+                **({"sticker_emoji": "★"} if kind == "sticker" else {}),
             )
         )
     return write_json(root, rows)

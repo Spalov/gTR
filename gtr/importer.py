@@ -16,6 +16,7 @@ from .filenames import safe_filename
 from .journal import Journal, RecoveryRequired, State, safe_constructor, timestamp
 from .media import KIND_NAMES
 from .media_engine import archive_paths, inspect_bundle
+from .media_recovery import bundle_issues, force_file, source_kind
 from .model import Cancelled, RecoveryError, quiet
 
 __all__ = ["FAULTS", "HistoryAPI", "ImportController", "ImportFault", "Journal", "Preflight", "run_import"]
@@ -75,10 +76,13 @@ def _media_attempt(index, total, item, record, facts=None):
         "declared_mime": _accepted_mime(item.get("declared_mime")),
         "wire_mime": _accepted_mime(item.get("mime")),
         "kind": item["kind"] if item["kind"] in KIND_NAMES else "unknown",
+        "source_kind": (record.get("media_recovery") or {}).get("source_kind")
+        or source_kind(item, item.get("detected_mime") or item.get("mime")),
         "upload_as": upload_as,
         "size": item["size"],
         "sha256": item["sha256"],
         "attributes": attributes,
+        "force_file": bool(force_file(item)) if upload_as == "document" else False,
         "input_media": "InputMediaUploadedPhoto" if upload_as == "photo" else "InputMediaUploadedDocument",
         "stage": "upload_item",
         "status": "UPLOADING_ITEM",
@@ -116,6 +120,7 @@ class ImportController:
         self.files = ExitStack()
         self.media_attempt: dict | None = None
         self.media_facts = []
+        self.media_issues = []
 
     def _record(self, state: State, stage: str, **args):
         if self.journal and self.job:
@@ -190,6 +195,7 @@ class ImportController:
                 fault = ImportFault("LOCAL_JOURNAL_UNAVAILABLE", stage=self.stage)
         fault.operation_id = self.job
         fault.media_attempt = self.media_attempt
+        fault.media_issues = self.media_issues
         try:
             self.progress("limited" if fault.code in RESTRICTIONS else "error", 0, 0)
         except Cancelled:
@@ -238,10 +244,13 @@ class ImportController:
             if self.mode == "owner" and checked.data["media"]:
                 inventory = inspect_bundle(checked, self.progress, hash_verified=True)
                 self.media_facts = inventory["items"]
-                if bad := next((item for item in self.media_facts if item["blocked"]), None):
-                    record = next(
-                        (entry for entry in checked.data["records"] if entry.get("media") == bad["name"]), {}
-                    )
+                self.media_issues = bundle_issues(checked, inventory)
+                blocked = {entry["name"]: entry["reason"] for entry in self.media_issues}
+                records = {entry["media"]: entry for entry in checked.data["records"] if entry.get("media")}
+                for bad in self.media_facts:
+                    if not (bad["blocked"] or bad["name"] in blocked):
+                        continue
+                    record = records.get(bad["name"], {})
                     attempt = _media_attempt(
                         bad["index"], inventory["count"], checked.data["media"][bad["index"] - 1], record, bad
                     )
@@ -249,12 +258,14 @@ class ImportController:
                         stage="inspect_media",
                         status="MEDIA_LOCAL_REJECTED",
                         error_code="MEDIA_LOCAL_INVALID",
+                        local_issue=blocked.get(bad["name"], "attachment_format"),
                         ended_at=timestamp(),
                     )
-                    self.media_attempt = attempt
+                    self.media_attempt = self.media_attempt or attempt
                     if self.journal and self.job:
                         self.journal.begin_media(self.job, attempt)
                         self.journal.finish_media(self.job, attempt)
+                if self.media_attempt:
                     raise ImportFault("MEDIA_LOCAL_INVALID", stage="inspect_media")
             self._advance(State.VALIDATING, "validated", checked.data["included"], checked.data["included"])
             self._advance(State.VALIDATING, "check_history")
@@ -310,6 +321,9 @@ class ImportController:
                 self.journal.media_stage(self.job, index, name)
 
         stage.response = lambda actual: attempt.update(received_kind=actual)
+        stage.response_details = lambda mime, attributes: attempt.update(
+            received_mime=_accepted_mime(mime), received_attributes=attributes
+        )
         report = getattr(self.progress, "upload_bytes", None)
         if report:
             stage.upload_bytes = lambda name, sent, size, speed: report(
