@@ -9,11 +9,12 @@ from gtr.account import AccountManager, Login, Target
 from gtr.conversion import prepare
 from gtr.core import analyze
 from gtr.faults import ImportFault
+from gtr.headless_owner import OwnerFlow
 from gtr.importer import ImportController
 from gtr.incremental_import import history, local_preview, recover_package
 from gtr.journal import Endpoint, Journal, RecoveryRequired, State
 from gtr.mock_api import MockAPI, offline_result
-from gtr.model import RecoveryError
+from gtr.model import RecoveryError, quiet
 from gtr.server import OwnerSession
 from gtr.test_mode import reset_test_registry
 
@@ -219,6 +220,68 @@ def test_import_delete_on_both_accounts_and_repeat_without_erasing_audit(tmp_pat
         offline_result(session.disconnect())
 
 
+def test_native_prepare_test_package_after_both_accounts_confirm_an_empty_dialog(tmp_path, trial):
+    project, server, journal, target = trial
+    transport = ImportToMemory(server)
+    session = OwnerSession(
+        AccountManager(server.make_client, timed=False),
+        lambda *args, **kwargs: transport,
+        partial(journal_for, journal.path),
+    )
+    bundle = prepare(project, 1, tmp_path / "normal", "source", media_mode="text_only")
+    params = {"target": str(SECOND), "project": str(project), "bundle": str(bundle.root), "test": True}
+    flow = OwnerFlow(session)
+    flow.targets[str(SECOND)] = target
+    try:
+        offline_result(session.connect(11, "a" * 32, f"+1234567{FIRST}", False))
+        offline_result(session.manager.submit_code("12345"))
+        with pytest.raises(ImportFault) as error:
+            offline_result(flow.run("import.validate", {**params, "consented": True}, quiet))
+        assert (error.value.code, error.value.stage) == ("TEST_RESET_REQUIRED", "test_scope")
+        assert not transport.calls
+
+        flow.test_login(second_account_reset(session, target))
+        with pytest.raises(ImportFault) as error:
+            offline_result(flow.run("import.validate", {**params, "consented": True}, quiet))
+        assert (error.value.code, error.value.stage) == ("TEST_PACKAGE_REQUIRED", "test_scope")
+        assert not transport.calls
+
+        prepared = offline_result(flow.run("import.test_package", {**params, "confirmed": True}, quiet))
+        assert server.reads == [FIRST, SECOND]
+        receipt = offline_result(flow.run(
+            "import.validate",
+            {**params, "bundle": prepared["path"], "manifest": prepared["manifest"], "consented": True},
+            quiet,
+        ))
+        assert receipt["messages"] == bundle.data["included"] == 3 and receipt["lease"]
+        assert transport.calls == ["check_history", "check_peer"]
+    finally:
+        offline_result(session.disconnect())
+
+
+def test_native_saved_dialog_unavailable_before_validating_the_package(trial):
+    project, server, journal, target = trial
+
+    class EmptyContacts(HistoryClient):
+        async def __call__(self, request):
+            assert isinstance(request, functions.contacts.GetContactsRequest)
+            return types.contacts.Contacts([], 0, [])
+
+    manager = AccountManager(lambda *_: EmptyContacts(server), timed=False)
+    login(manager, FIRST)
+    transport = ImportToMemory(server)
+    flow = OwnerFlow(OwnerSession(manager, lambda *args, **kwargs: transport, partial(journal_for, journal.path)))
+    flow.targets[str(SECOND)] = Target(SECOND, target.title, "pm", None)
+    try:
+        params = {"target": str(SECOND), "project": str(project), "bundle": str(project), "consented": True}
+        with pytest.raises(ImportFault) as error:
+            offline_result(flow.run("import.validate", params, quiet))
+        assert (error.value.code, error.value.stage) == ("SAVED_DIALOG_UNAVAILABLE", "resolve_target")
+        assert not transport.calls
+    finally:
+        offline_result(manager.disconnect())
+
+
 @pytest.mark.parametrize(
     "condition", ["not_modified", "inexact", "inconsistent", "rpc", "other_account", "live_import"]
 )
@@ -391,8 +454,10 @@ def test_profile_button_opens_second_account_login_and_full_archive(tmp_path, tr
         panel.account = account
         window.show()
         window.show_import_profiles()
-        app.processEvents()
         page = window.profiles_page
+        # Exercise the reset controls before the delayed profile preview navigates away.
+        page.timer.stop()
+        app.processEvents()
         next(b for b in page.findChildren(QPushButton) if b.text() == "Изменить параметры").click()
         assert not page.test_mode.isChecked() and page.reset_tests.isHidden() and panel.target.count() == 0
         page.test_mode.click()

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .account import Account, AccountManager, Target
 from .conversion import load_bundle
+from .faults import ImportFault
 from .importer import ImportController, Preflight
 from .integrity import check_local
 from .journal import Journal, State
@@ -20,6 +21,7 @@ from .owner import (
     save_api_credentials,
     save_session,
 )
+from .package_errors import PackageValidationError
 from .test_mode import reset_test_registry
 
 
@@ -30,6 +32,26 @@ class Review:
     check: Preflight
     local: dict
     test_reset_id: int | None = None
+
+
+def _review_package(root, project, expected, progress):
+    bundle = load_bundle(root, progress)
+    actual = bundle.manifest_hash()
+    if expected is not None and actual != expected:
+        raise PackageValidationError("MANIFEST_MISMATCH", "load_manifest", "manifest_sha256",
+                                     file="manifest.json", expected=expected, actual=actual)
+    verified = check_local(bundle, project, progress)
+    if verified["status"] == "differences":
+        conflict = verified["differences"][0]
+        ordinal = conflict.get("ordinal", 0)
+        record = bundle.data["records"][ordinal - 1] if 1 <= ordinal <= len(bundle.data["records"]) else None
+        raise PackageValidationError(
+            "MANIFEST_MISMATCH", "local_history", conflict["code"], file="manifest.json", record=record,
+            expected=conflict.get("expected", "совпадение с исходным проектом"),
+            actual=conflict.get("actual", "найдено расхождение"),
+            reason="Пакет отличается от открытого исходного проекта.",
+        )
+    return bundle, verified
 
 
 class OwnerSession:
@@ -77,14 +99,14 @@ class OwnerSession:
                 "Перед сетевой проверкой подтвердите согласие участников для этого пакета и чата."
             )
         self.discard()
-        bundle = load_bundle(root, progress)
-        if expected is not None and bundle.manifest_hash() != expected:
-            raise RecoveryError(
-                "Пакет изменился. Откройте его заново и подтвердите согласие для выбранной цели."
-            )
-        local = check_local(bundle, project, progress)
-        if local["status"] == "differences":
-            raise RecoveryError("Выбранный проект не прошёл сверку с пакетом. Проверьте пакет и оригиналы.")
+        try:
+            bundle, local = _review_package(root, project, expected, progress)
+        except PackageValidationError as error:
+            fault = ImportFault.from_package(error)
+            with suppress(OSError, RecoveryError, sqlite3.Error):
+                journal = self.journal_factory(account, target)
+                fault.operation_id = journal.record_invalid_package(fault, test_reset_id)
+            raise fault from None
         from .incremental_import import discover_for_package, remember_profile
 
         journal = self.journal_factory(account, target)
@@ -93,6 +115,8 @@ class OwnerSession:
 
             if target.kind != "pm" or target.id == account.id:
                 raise RecoveryError("Тестовый импорт доступен в личном диалоге двух аккаунтов.")
+            if bundle.data.get("test_reset_id") != test_reset_id:
+                raise ImportFault("TEST_PACKAGE_REQUIRED", stage="test_scope")
             journal = Journal(journal.path, journal.endpoint, test_reset_id=test_reset_id)
             if target.input_peer is None:
                 target = await self.manager.test_target(target.id, target.title)
@@ -182,6 +206,9 @@ class OwnerSession:
             return await reset_test_registry(
                 journal, self.manager, self._test_partner, target.id, target.title
             )
+        except ImportFault as error:
+            more_steps = error.code in {"PHONE_CODE_INVALID", "PASSWORD_HASH_INVALID"}
+            raise
         finally:
             if not more_steps:
                 await self.cancel_test_reset()

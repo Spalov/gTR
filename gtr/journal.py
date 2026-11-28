@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .files import local
 from .model import RecoveryError
+from .package_errors import public_package_issue
 from .selection import (
     Intervals,
     count,
@@ -173,6 +174,7 @@ OPERATION_COLUMNS = {
     "selected_messages": "INTEGER",
     "validated_messages": "INTEGER NOT NULL DEFAULT 0",
     "accuracy": "TEXT",
+    "package_issue": "TEXT",
 }
 EVENT_COLUMNS = {"phase": "TEXT NOT NULL DEFAULT ''"}
 WORKER_COLUMNS = {"process_started_at": "TEXT NOT NULL DEFAULT ''", "disconnected_at": "TEXT"}
@@ -675,6 +677,23 @@ class Journal:
             register(db, job, bundle)
         return job
 
+    def record_invalid_package(self, fault, test_reset_id=None):
+        """Record a rejected preflight without registering records or reserving a destination."""
+        from . import __version__
+
+        job = uuid4().hex
+        with self.connect(lock=True) as db:
+            db.execute(
+                """INSERT INTO operations(id,created,peer,account,mode,fingerprint,scope,manifest_sha256,
+                   state,stage,messages,media,skipped,duplicates,error_code,phase,app_version,test_reset_id,package_issue)
+                   VALUES (?,?,?,?,'owner','','','',?,?,0,0,0,0,?,?,?,?,?)""",
+                (job, timestamp(), self.endpoint.key, self.endpoint.account_id, State.FAILED, fault.stage,
+                 fault.code, Phase.FAILED, __version__, test_reset_id,
+                 json.dumps(fault.package_issue, ensure_ascii=False)),
+            )
+            self._event(db, job, State.FAILED, fault.stage, 0, 0, fault.code)
+        return job
+
     def _event(self, db, job, state, stage, done, total, code):
         db.execute(
             "INSERT INTO operation_events(operation,ts,state,stage,done,total,code,phase) VALUES (?,?,?,?,?,?,?,?)",
@@ -770,6 +789,9 @@ class Journal:
                 ),
             )
             self._event(db, job, state, stage, done, total, code if fault else "")
+            if fault and getattr(fault, "package_issue", None):
+                db.execute("UPDATE operations SET package_issue=? WHERE id=?",
+                           (json.dumps(fault.package_issue, ensure_ascii=False), job))
 
     @staticmethod
     def _operation(row):
@@ -893,7 +915,7 @@ class Journal:
             "error_code",
             *(
                 OPERATION_COLUMNS.keys()
-                - {"content_fingerprint", "selection", "selected_messages", "validated_messages"}
+                - {"content_fingerprint", "selection", "selected_messages", "validated_messages", "package_issue"}
             ),
             "source_records",
             "package_records",
@@ -914,13 +936,17 @@ class Journal:
                 "content_fingerprint",
                 "selection",
             }
-        return {
+        report = {
             "schema": 1,
             "redacted": not private,
             "operation": {k: v for k, v in operation.items() if k in keys},
             "events": events,
             "media_attempts": attempts if private else list(map(redact_attempt, attempts)),
         }
+        if operation["package_issue"]:
+            issue = json.loads(operation["package_issue"])
+            report["package_issue"] = issue if private else public_package_issue(issue)
+        return report
 
     def events(self, job: str) -> list[dict]:
         with self.connect() as db:

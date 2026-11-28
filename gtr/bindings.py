@@ -3,7 +3,7 @@
 from hashlib import sha256
 from pathlib import PurePosixPath
 
-from .model import RecoveryError
+from .package_errors import PackageValidationError
 from .profiles import ANDROID_MARKER, MARKER, PROFILES
 
 VERSION = 1
@@ -14,14 +14,9 @@ ANDROID = {"photo": "IMG", "voice": "PTT", "audio": "AUD", "video": "VID",
            "round_video": "VID", "sticker": "STK", "animation": "GIF"}
 
 
-class AttachmentBindingError(RecoveryError):
-    code = UNRESOLVED
-
-    def __init__(self):
-        super().__init__(
-            "Пакет неполон или повреждён. Связь вложения не прошла проверку. "
-            "Подготовьте новый пакет из исходного проекта."
-        )
+class AttachmentBindingError(PackageValidationError):
+    def __init__(self, field="wire_name", **details):
+        super().__init__("ATTACHMENT_BINDING_INVALID", "verify_binding", field, **details)
 
 
 def requested_kind(item):
@@ -64,9 +59,13 @@ def bind(source_hash, chat, record, item, ordinal, date, profile):
 
 def check_binding(data, record, item, ordinal, date):
     expected = identity(data["source_sha256"], data["chat_id"], record)
-    if (item.get("attachment_id") != expected or record.get("attachment_id") != expected
-            or item.get("wire_name") != alias(item, ordinal, date, data["profile"])):
-        raise AttachmentBindingError()
+    for field, value, actual in (
+        ("media.attachment_id", expected, item.get("attachment_id")),
+        ("records.attachment_id", expected, record.get("attachment_id")),
+        ("wire_name", alias(item, ordinal, date, data["profile"]), item.get("wire_name")),
+    ):
+        if value != actual:
+            raise AttachmentBindingError(field, file=item["name"], record=record, expected=value, actual=actual)
 
 
 def digest_text(text):

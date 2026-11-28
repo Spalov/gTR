@@ -8,13 +8,18 @@
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QDesktopServices>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHeaderView>
 #include <QImageReader>
+#include <QInputDialog>
+#include <QJsonDocument>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListView>
@@ -24,6 +29,7 @@
 #include <QMessageBox>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QSaveFile>
 #include <QScrollArea>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -36,6 +42,7 @@
 #include <QVideoWidget>
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace {
@@ -257,7 +264,7 @@ Window::Window(QString root, QString python, const QString &initialProject)
     update_ = button(B("Обновление…", "Оновлення…"), this, [this] { updates(true); });
     update_->hide();
     head->addWidget(update_);
-    head->addWidget(button(B("Аккаунт", "Обліковий запис"), this, [this] { classic("telegram"); }));
+    head->addWidget(button(B("Аккаунт", "Обліковий запис"), this, [this] { showAccount(); }));
     outer->addWidget(top);
 
     auto *main = new QHBoxLayout;
@@ -304,6 +311,10 @@ Window::Window(QString root, QString python, const QString &initialProject)
     });
     restart_->hide();
     work->addWidget(restart_);
+    saveDiagnostic_ = button(B("Сохранить диагностический отчёт…", "Зберегти діагностичний звіт…"),
+                             this, [this] { saveValidationDiagnostic(); });
+    saveDiagnostic_->hide();
+    work->addWidget(saveDiagnostic_);
     outer->addWidget(footer);
     connect(nav_, &QListWidget::currentRowChanged, this, [this](int row) { go(row); });
     nav_->setCurrentRow(Home);
@@ -322,6 +333,12 @@ Window::Window(QString root, QString python, const QString &initialProject)
     };
     service_.onFailure = [this](const QString &error) {
         status(fault(error));
+        account_->setText(B("Telegram · локальный режим", "Telegram · локальний режим"));
+        testTarget_.clear();
+        if (lastDiagnostic_.isEmpty()) {
+            lastDiagnostic_ = {{"schema", 1}, {"redacted", true}, {"component", "ipc"}, {"code", error}};
+            saveDiagnostic_->show();
+        }
         cancel_->hide();
         progress_->hide();
         restart_->show();
@@ -405,7 +422,103 @@ QWidget *Window::archivePage() {
     query_->setAccessibleName(query_->placeholderText());
     filters->addWidget(query_, 2);
     filters->addWidget(button(B("Найти", "Знайти"), this, [this] { messages(); }));
+    filters->addWidget(button(B("Фильтры…", "Фільтри…"), this, [this] { selectionFilterDialog(); }));
     layout->addLayout(filters);
+    auto *editor = new QGridLayout;
+    auto *edit = new QPushButton(B("Редактор архива", "Редактор архіву"));
+    auto *commands = new QMenu(edit);
+    const auto change = [this](const QString &action) {
+        QList<int> ordinals;
+        for (const auto &index : recordList_->selectionModel()->selectedRows()) {
+            const int ordinal = index.data(RecordData).toJsonObject()["ordinal"].toInt();
+            if (ordinal > 0)
+                ordinals.append(ordinal);
+        }
+        std::sort(ordinals.begin(), ordinals.end());
+        QJsonArray ranges;
+        for (const int ordinal : std::as_const(ordinals))
+            ranges.append(QJsonArray{ordinal, ordinal});
+        if (!ranges.isEmpty())
+            editSelection(action, {{"ranges", ranges}});
+    };
+    commands->addAction(B("Исключить выбранные", "Виключити вибрані"), this, [change] { change("exclude"); });
+    commands->addAction(B("Включить выбранные", "Включити вибрані"), this, [change] { change("include"); });
+    commands->addAction(B("Исключить диапазон…", "Виключити діапазон…"), this, [this] {
+        bool accepted = false;
+        const auto maximum = std::numeric_limits<int>::max();
+        const auto first = QInputDialog::getInt(this, "gTR", B("Первый номер записи", "Перший номер запису"),
+            std::max(1, selectedRecord_["ordinal"].toInt()), 1, maximum, 1, &accepted);
+        if (!accepted)
+            return;
+        const auto last = QInputDialog::getInt(this, "gTR", B("Последний номер записи", "Останній номер запису"),
+            first, first, maximum, 1, &accepted);
+        if (accepted)
+            editSelection("exclude", {{"ranges", QJsonArray{QJsonArray{first, last}}}});
+    });
+    commands->addAction(B("Исключить все совпадения…", "Виключити всі збіги…"), this, [this] {
+        if (QMessageBox::question(this, "gTR",
+                B("Исключить все записи, соответствующие текущим фильтрам, включая другие страницы?",
+                  "Виключити всі записи, що відповідають поточним фільтрам, включно з іншими сторінками?"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes)
+            editSelection("exclude", {{"filters", selectionFilters()}});
+    });
+    commands->addAction(B("Локальная отметка…", "Локальна позначка…"), this, [this] {
+        const auto ordinal = selectedRecord_["ordinal"].toInt();
+        if (ordinal <= 0)
+            return;
+        bool accepted = false;
+        const auto note = QInputDialog::getText(this, "gTR", B("Заметка для этой записи", "Нотатка для цього запису"),
+            QLineEdit::Normal, selectedRecord_["note"].toString(), &accepted);
+        if (accepted)
+            editSelection("mark", {{"ranges", QJsonArray{QJsonArray{ordinal, ordinal}}}, {"note", note}});
+    });
+    commands->addAction(B("Сохранить отдельную выборку…", "Зберегти окрему вибірку…"), this, [this] {
+        bool accepted = false;
+        const auto name = QInputDialog::getText(this, "gTR", B("Название выборки", "Назва вибірки"),
+                                               QLineEdit::Normal, {}, &accepted);
+        if (accepted)
+            editSelection("save_as", {{"name", name}});
+    });
+    commands->addAction(B("Вернуть исходный состав", "Повернути вихідний склад"), this,
+                        [this] { editSelection("reset"); });
+    commands->addAction(B("Состав будущего импорта…", "Склад майбутнього імпорту…"), this,
+                        [this] { selectionPreview(); });
+    edit->setMenu(commands);
+    editor->addWidget(edit, 0, 0);
+    selectionPreset_ = new QComboBox;
+    selectionPreset_->setObjectName("selection-preset");
+    selectionPreset_->setMinimumContentsLength(8);
+    selectionPreset_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    selectionPreset_->setAccessibleName(B("Выборка", "Вибірка"));
+    selectionPreset_->addItem(B("Основная выборка", "Основна вибірка"), "");
+    editor->addWidget(selectionPreset_, 0, 1, 1, 2);
+    selectionView_ = new QComboBox;
+    selectionView_->setAccessibleName(B("Показать записи", "Показати записи"));
+    selectionView_->addItem(B("Исходная история", "Вихідна історія"), "all");
+    selectionView_->addItem(B("Будущий импорт", "Майбутній імпорт"), "included");
+    selectionView_->addItem(B("Исключённые", "Виключені"), "excluded");
+    editor->addWidget(selectionView_, 1, 0);
+    undoSelection_ = button(QStringLiteral("↶"), this, [this] { editSelection("undo"); });
+    redoSelection_ = button(QStringLiteral("↷"), this, [this] { editSelection("redo"); });
+    undoSelection_->setAccessibleName(B("Отменить изменение выборки", "Скасувати зміну вибірки"));
+    redoSelection_->setAccessibleName(B("Повторить изменение выборки", "Повторити зміну вибірки"));
+    for (auto *control : {undoSelection_, redoSelection_}) {
+        control->setToolTip(control->accessibleName());
+        control->setFixedWidth(39);
+    }
+    undoSelection_->setEnabled(false);
+    redoSelection_->setEnabled(false);
+    editor->addWidget(undoSelection_, 1, 1);
+    editor->addWidget(redoSelection_, 1, 2);
+    layout->addLayout(editor);
+    connect(selectionPreset_, &QComboBox::activated, this, [this] {
+        selectionRevision_.clear();
+        plan_ = {};
+        bundle_.clear();
+        step(Source);
+        messages();
+    });
+    connect(selectionView_, &QComboBox::activated, this, [this] { messages(); });
     connect(chat_, &QComboBox::currentIndexChanged, this, [this] { selectChat(); });
     connect(query_, &QLineEdit::returnPressed, this, [this] { messages(); });
     connect(query_, &QLineEdit::textEdited, this, [this] {
@@ -413,11 +526,12 @@ QWidget *Window::archivePage() {
         older_->setEnabled(false);
     });
     auto *split = new QSplitter(Qt::Horizontal);
-    auto *list = new QListView;
+    auto *list = recordList_ = new QListView;
     list->setObjectName("archive-records");
     list->setWordWrap(true);
     list->setTextElideMode(Qt::ElideRight);
     list->setAccessibleName(B("Записи диалога", "Записи діалогу"));
+    list->setSelectionMode(QAbstractItemView::ExtendedSelection);
     records_ = new QStandardItemModel(this);
     list->setModel(records_);
     split->addWidget(list);
@@ -510,7 +624,7 @@ QWidget *Window::archivePage() {
         status(B("Windows не может воспроизвести этот формат.", "Windows не може відтворити цей формат."));
     });
     auto *detailsScroll = scrollable(details->parentWidget());
-    detailsScroll->setMinimumWidth(210);
+    detailsScroll->setMinimumWidth(165);
     split->addWidget(detailsScroll);
     split->setChildrenCollapsible(false);
     split->setStretchFactor(0, 1);
@@ -633,7 +747,7 @@ QWidget *Window::recoveryPage() {
     result->addWidget(result_);
     result->addWidget(button(B("Проверить пакет", "Перевірити пакет"), this, [this] { verify(false); }), 0, Qt::AlignLeft);
     result->addWidget(button(B("Открыть серверный импорт…", "Відкрити серверний імпорт…"), this,
-                              [this] { if (!bundle_.isEmpty()) classic("import"); }, true), 0, Qt::AlignLeft);
+                              [this] { if (!bundle_.isEmpty()) selectTarget(); }, true), 0, Qt::AlignLeft);
     result->addStretch();
     wizard_->addWidget(result->parentWidget());
 
@@ -667,7 +781,13 @@ QWidget *Window::historyPage() {
     layout->addWidget(label(B("История", "Історія"), "title"));
     auto *actions = new QHBoxLayout;
     actions->addWidget(button(B("Обновить", "Оновити"), this, [this] { showHistory(); }));
-    actions->addWidget(button(B("Журнал операций…", "Журнал операцій…"), this, [this] { classic("history"); }));
+    auto *menuButton = new QPushButton(B("Действия…", "Дії…"));
+    auto *menu = new QMenu(menuButton);
+    menu->addAction(B("Обезличенный отчёт…", "Знеособлений звіт…"), this, [this] { operationDiagnostic(false); });
+    menu->addAction(B("Локальный отчёт…", "Локальний звіт…"), this, [this] { operationDiagnostic(true); });
+    menu->addAction(B("Открыть пакет операции…", "Відкрити пакет операції…"), this, [this] { operationBundle(); });
+    menuButton->setMenu(menu);
+    actions->addWidget(menuButton);
     actions->addStretch();
     layout->addLayout(actions);
     history_ = new QTableWidget;
@@ -723,16 +843,13 @@ QWidget *Window::settingsPage() {
     });
     form->addRow(B("Даты без часового пояса", "Дати без часового поясу"), zone);
     preferences->addLayout(form);
-    auto *applyLanguage = button(B("Сохранить язык и перезапустить", "Зберегти мову й перезапустити"), this, [this, language] {
+    auto *applyLanguage = button(B("Сохранить язык", "Зберегти мову"), this, [this, language] {
         if (service_.busy())
             return;
         QSettings settings;
         settings.setValue("language", language->currentData());
         settings.sync();
-        auto args = QCoreApplication::arguments();
-        args.removeFirst();
-        if (QProcess::startDetached(QCoreApplication::applicationFilePath(), args, root_))
-            close();
+        status(B("Язык изменится при следующем запуске.", "Мова зміниться під час наступного запуску."));
     });
     preferences->addWidget(applyLanguage, 0, Qt::AlignLeft);
     layout->addWidget(preferences->parentWidget());
@@ -756,10 +873,11 @@ QWidget *Window::settingsPage() {
     auto *about = card();
     about->addWidget(label(B("О программе", "Про програму"), "subtitle"));
     about->addWidget(muted("gTR " GTR_RELEASE_LABEL " · Gruzin · Apache 2.0"));
-    about->addWidget(button(B("Проверить загрузки…", "Перевірити завантаження…"), this,
+    about->addWidget(button(B("Проверить обновления в gAssets…", "Перевірити оновлення в gAssets…"), this,
                              [this] { updates(true); }), 0, Qt::AlignLeft);
-    about->addWidget(button(B("Дополнительные настройки…", "Додаткові налаштування…"), this,
-                             [this] { classic("settings"); }), 0, Qt::AlignLeft);
+    about->addWidget(button(B("Открыть выпуски на GitHub…", "Відкрити випуски на GitHub…"), this, [] {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://github.com/Spalov/gTR/releases")));
+    }), 0, Qt::AlignLeft);
     about->addWidget(button(B("Как подготовить экспорт…", "Як підготувати експорт…"), this, [this] {
         QMessageBox::information(this, "gTR",
             B("В Telegram Desktop откройте диалог, нажмите ⋮ → Экспорт истории чата. Выберите JSON или HTML "
@@ -878,6 +996,12 @@ void Window::selectChat() {
     bundle_.clear();
     decisions_ = {};
     cursor_ = 0;
+    selectionRevision_.clear();
+    selectionFilters_ = {};
+    if (selectionPreset_) {
+        const QSignalBlocker block(selectionPreset_);
+        selectionPreset_->setCurrentIndex(0);
+    }
     {
         const QSignalBlocker block(query_);
         query_->clear();
@@ -892,10 +1016,21 @@ void Window::selectChat() {
 void Window::messages(bool next) {
     if (project_.isEmpty() || !chat_->currentData().isValid() || (next && cursor_ <= 0))
         return;
-    QJsonObject request{{"project", project_}, {"chat", chat_->currentData().toInt()}, {"query", query_->text().trimmed()}};
+    auto request = selectionScope();
+    request["filters"] = selectionFilters();
     if (next)
         request["before"] = cursor_;
-    task(B("Чтение архива", "Читання архіву"), "chat.page", request, [this](const QJsonObject &value) {
+    task(B("Чтение архива", "Читання архіву"), "selection.page", request, [this](const QJsonObject &value) {
+        const auto preset = selectionPreset_->currentData().toString();
+        const QSignalBlocker block(selectionPreset_);
+        selectionPreset_->clear();
+        selectionPreset_->addItem(B("Основная выборка", "Основна вибірка"), "");
+        for (const auto &name : value["presets"].toArray())
+            selectionPreset_->addItem(name.toString(), name.toString());
+        selectionPreset_->setCurrentIndex(std::max(0, selectionPreset_->findData(preset)));
+        selectionRevision_ = value["revision"].toString();
+        undoSelection_->setEnabled(value["undo"].toBool());
+        redoSelection_->setEnabled(value["redo"].toBool());
         records_->clear();
         QString lastDay;
         for (const auto &entry : value["records"].toArray()) {
@@ -917,12 +1052,112 @@ void Window::messages(bool next) {
             if (row["is_forward"].toInt())
                 text = B("Переслано · %1", "Переслано · %1").arg(text);
             auto *item = new QStandardItem(sender + "  ·  " + when.mid(11, 8) + "\n" + text);
+            if (row["excluded"].toInt()) {
+                auto style = item->font();
+                style.setStrikeOut(true);
+                item->setFont(style);
+            }
             item->setEditable(false);
             item->setData(row, RecordData);
             records_->appendRow(item);
         }
         cursor_ = value["before"].toInteger();
         older_->setEnabled(cursor_ > 0);
+    });
+}
+
+QJsonObject Window::selectionScope() const {
+    return {{"project", project_}, {"chat", chat_->currentData().toInt()},
+            {"preset", selectionPreset_->currentData().toString()}};
+}
+
+QJsonObject Window::selectionFilters() const {
+    auto filters = selectionFilters_;
+    filters["query"] = query_->text().trimmed();
+    filters["view"] = selectionView_->currentData().toString();
+    return filters;
+}
+
+void Window::editSelection(const QString &action, QJsonObject params) {
+    if (selectionRevision_.isEmpty())
+        return;
+    const auto scope = selectionScope();
+    for (auto it = scope.begin(); it != scope.end(); ++it)
+        params[it.key()] = it.value();
+    params["action"] = action;
+    params["revision"] = selectionRevision_;
+    task(B("Сохранение выборки", "Збереження вибірки"), "selection.edit", params, [this, action](const QJsonObject &value) {
+        if (action != "mark") {
+            const auto name = value["preset"].toString();
+            if (selectionPreset_->findData(name) < 0)
+                selectionPreset_->addItem(name, name);
+            selectionPreset_->setCurrentIndex(selectionPreset_->findData(name));
+            plan_ = {};
+            bundle_.clear();
+            step(Source);
+        }
+        messages();
+    });
+}
+
+void Window::selectionFilterDialog() {
+    QDialog dialog(this);
+    dialog.setWindowTitle(B("Фильтры архива", "Фільтри архіву"));
+    QFormLayout form(&dialog);
+    QComboBox field, kind;
+    field.addItem(B("Все поля", "Усі поля"), "all");
+    field.addItem(B("Текст", "Текст"), "text");
+    field.addItem(B("Автор", "Автор"), "sender");
+    field.addItem(B("Исходный ID", "Вихідний ID"), "id");
+    field.addItem(B("Имя файла", "Назва файла"), "file");
+    kind.addItem(B("Все записи", "Усі записи"), "");
+    kind.addItem(B("Текст", "Текст"), "text");
+    kind.addItem(B("Пересланные", "Переслані"), "forward");
+    kind.addItem(B("Служебные", "Службові"), "service");
+    for (const auto &type : {"photo", "video", "sticker", "voice", "audio", "document"})
+        kind.addItem(mediaKind(type), type);
+    field.setCurrentIndex(std::max(0, field.findData(selectionFilters_["field"].toString())));
+    kind.setCurrentIndex(std::max(0, kind.findData(selectionFilters_["kind"].toString())));
+    QLineEdit from(selectionFilters_["start"].toString()), to(selectionFilters_["end"].toString());
+    for (auto *edit : {&from, &to}) {
+        edit->setPlaceholderText("YYYY-MM-DD");
+        edit->setMaxLength(10);
+    }
+    form.addRow(B("Искать по", "Шукати за"), &field);
+    form.addRow(B("Тип записи", "Тип запису"), &kind);
+    form.addRow(B("С даты включительно", "Від дати включно"), &from);
+    form.addRow(B("По дату включительно", "До дати включно"), &to);
+    QDialogButtonBox controls(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    form.addRow(&controls);
+    connect(&controls, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
+    connect(&controls, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    if (dialog.exec() == QDialog::Accepted) {
+        selectionFilters_ = {{"field", field.currentData().toString()}, {"kind", kind.currentData().toString()},
+                             {"start", from.text().trimmed()}, {"end", to.text().trimmed()}};
+        messages();
+    }
+}
+
+void Window::selectionPreview() {
+    if (project_.isEmpty() || !chat_->currentData().isValid())
+        return;
+    task(B("Подсчёт выборки", "Підрахунок вибірки"), "selection.preview", selectionScope(), [this](const QJsonObject &value) {
+        QMessageBox box(QMessageBox::Information, B("Будущий импорт", "Майбутній імпорт"),
+            B("Включено сообщений %1 из %2 · исключено записей %3\nВложения %4 · исходный объём %5\n%6 — %7\n"
+              "Разрывы %8 · отсутствующие адресаты ответов %9 · разделённые альбомы %10\n"
+              "Служебных записей только локально %11. Telegram может изменить отображение медиа и связей.",
+              "Включено повідомлень %1 із %2 · виключено записів %3\nВкладення %4 · вихідний обсяг %5\n%6 — %7\n"
+              "Розриви %8 · відсутні адресати відповідей %9 · розділені альбоми %10\n"
+              "Службових записів лише локально %11. Telegram може змінити відображення медіа й зв’язків.")
+            .arg(count(value["selected"].toInteger()), count(value["total"].toInteger()),
+                 count(value["excluded"].toInteger()), count(value["attachments"].toInteger()),
+                 amount(value["source_bytes"].toInteger()), date(value["first"]), date(value["last"]),
+                 count(value["gaps"].toInteger()), count(value["broken_replies"].toInteger()),
+                 count(value["split_albums"].toInteger()), count(value["service"].toInteger())), QMessageBox::Ok, this);
+        box.setTextFormat(Qt::PlainText);
+        if (value["partial"].toBool())
+            box.setInformativeText(B("Выбрана часть истории.", "Вибрано частину історії."));
+        box.exec();
     });
 }
 
@@ -937,6 +1172,11 @@ void Window::showMessage(const QModelIndex &index) {
         return;
     }
     QString text = selectedRecord_["sender"].toString() + "\n" + date(selectedRecord_["date"]);
+    if (const auto ordinal = selectedRecord_["ordinal"].toInt(); ordinal > 0)
+        text += "\n" + B("Запись %1 · исходный ID %2", "Запис %1 · вихідний ID %2")
+            .arg(ordinal).arg(selectedRecord_["source_id"].toString());
+    if (const auto note = selectedRecord_["note"].toString(); !note.isEmpty())
+        text += "\n" + B("Локально · %1", "Локально · %1").arg(note);
     if (selectedRecord_["is_forward"].toInt()) {
         auto source = selectedRecord_["forwarded"].toString();
         if (source.isEmpty())
@@ -1003,7 +1243,8 @@ void Window::preview() {
 QJsonObject Window::recoveryOptions() const {
     return {{"project", project_}, {"chat", chat_->currentData().toInt()}, {"media", mediaMode_->currentData().toString()},
             {"video", videoPolicy_->currentData().toString()}, {"notes", noteMode_->currentData().toString()},
-            {"language", QSettings().value("language", "ru").toString()}, {"decisions", decisions_}};
+            {"language", QSettings().value("language", "ru").toString()}, {"decisions", decisions_},
+            {"preset", selectionPreset_->currentData().toString()}};
 }
 
 void Window::plan() {
@@ -1018,6 +1259,8 @@ void Window::setPlan(const QJsonObject &value) {
     const auto waiting = value["decisions_total"].toInt();
     QString report = value.isEmpty() ? B("Проверьте выбранные параметры.", "Перевірте вибрані параметри.")
                                     : planText(totals);
+    if (value["selection"].toObject()["partial"].toBool())
+        report.prepend(B("Выборочное восстановление · часть истории\n", "Вибіркове відновлення · частина історії\n"));
     if (waiting > 0)
         report += "\n" + B("Вложений с выбором %1", "Вкладень із вибором %1").arg(count(waiting));
     if (waiting > entries.size())
@@ -1072,8 +1315,10 @@ void Window::prepare() {
         return;
     auto params = recoveryOptions();
     params["confirmed"] = true;
+    params["snapshot"] = plan_["snapshot"];
     task(B("Подготовка пакета", "Підготовка пакета"), "recovery.prepare", params, [this](const QJsonObject &value) {
         bundle_ = value["path"].toString();
+        manifest_ = value["manifest"].toString();
         result_->setText(planText(value["summary"].toObject()));
         step(Result);
     });
@@ -1088,8 +1333,11 @@ void Window::showHistory() {
             const QStringList columns{date(row["created"]), operationState(row["state"].toString()),
                                       count(row["messages"].toInteger()),
                                       QStringLiteral("%1 / %2").arg(row["media_done"].toInt()).arg(row["media"].toInt())};
-            for (int col = 0; col < columns.size(); ++col)
-                history_->setItem(static_cast<int>(index), col, new QTableWidgetItem(columns[col]));
+            for (int col = 0; col < columns.size(); ++col) {
+                auto *cell = new QTableWidgetItem(columns[col]);
+                cell->setData(Qt::UserRole, row["id"].toString());
+                history_->setItem(static_cast<int>(index), col, cell);
+            }
         }
     });
 }
@@ -1105,13 +1353,13 @@ void Window::storage() {
 }
 
 void Window::verify(bool snapshots) {
-    QString root = bundle_;
+    QString root = snapshots && !historyBundle_.isEmpty() ? historyBundle_ : bundle_;
     if (root.isEmpty())
         root = QFileDialog::getExistingDirectory(this, B("Выберите папку пакета", "Виберіть теку пакета"));
     if (root.isEmpty())
         return;
     QJsonObject request{{"bundle", root}};
-    if (!project_.isEmpty())
+    if (!project_.isEmpty() && (!snapshots || historyBundle_.isEmpty()))
         request["project"] = project_;
     if (snapshots) {
         const auto captures = QFileDialog::getOpenFileNames(this, B("Выберите один или два снимка",
@@ -1119,6 +1367,12 @@ void Window::verify(bool snapshots) {
         if (captures.size() < 1 || captures.size() > 2)
             return;
         request["captures"] = QJsonArray::fromStringList(captures);
+        if (captures.size() == 2) {
+            request["reconcile"] = QMessageBox::question(this, "gTR",
+                B("После сверки записать подтверждённые совпадения в локальный реестр операций?",
+                  "Після звірки записати підтверджені збіги до локального реєстру операцій?"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+        }
     }
     task(B("Верификация", "Верифікація"), "verify.local", request, [this, snapshots](const QJsonObject &value) {
         if (snapshots) {
@@ -1135,58 +1389,41 @@ void Window::verify(bool snapshots) {
     });
 }
 
-void Window::classic(const QString &section) {
-    auto python = QFileInfo(python_).dir().filePath("pythonw.exe");
-    if (!QFileInfo::exists(python))
-        python = python_;
-    QStringList args{"-m", "gtr", "classic", "--section", section};
-    if (!projectData_.isEmpty())
-        args << "--project" << project_;
-    if (section == "import" && !bundle_.isEmpty())
-        args << "--bundle" << bundle_;
-    if (!QProcess::startDetached(python, args, root_))
-        status(B("Не удалось открыть прежний интерфейс.", "Не вдалося відкрити попередній інтерфейс."));
-}
-
 void Window::updates(bool prompt) {
-    if (!service_.available() || service_.busy())
+    const auto local = qEnvironmentVariable("LOCALAPPDATA");
+    if (local.isEmpty())
         return;
-    service_.send("update.check", {}, [this, prompt](const QJsonObject &value, const QString &error) {
-        if (!error.isEmpty()) {
-            if (prompt)
-                status(fault(error));
-            return;
-        }
-        const auto downloaded = value["download"].toObject();
-        const auto installed = value["installed"].toObject();
-        update_->setVisible(!downloaded.isEmpty() || !installed.isEmpty());
-        if (!prompt)
-            return;
-        if (downloaded.isEmpty() && installed.isEmpty()) {
-            status(B("В папке загрузок нет более новой версии gTR.", "У теці завантажень немає новішої версії gTR."));
-            return;
-        }
-        auto launch = [this](const QString &path) {
-            QJsonObject input{{"path", path}, {"confirmed", true}};
-            if (!projectData_.isEmpty())
-                input["project"] = project_;
-            task(B("Запуск новой версии", "Запуск нової версії"), "update.launch", input,
-                 [this](const QJsonObject &) { QTimer::singleShot(0, this, [this] { close(); }); });
-        };
-        if (!installed.isEmpty()) {
-            if (QMessageBox::question(this, "gTR", B("Открыть установленное обновление %1?",
-                                                    "Відкрити встановлене оновлення %1?").arg(installed["label"].toString()),
-                                      QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes)
-                launch(installed["path"].toString());
-        } else if (QMessageBox::question(this, "gTR",
-            B("Установить %1 из загрузок? gTR сверит файл с выпуском GitHub.",
-              "Установити %1 із завантажень? gTR звірить файл із випуском GitHub.").arg(downloaded["label"].toString()),
-            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes) {
-            task(B("Проверка и установка обновления", "Перевірка й установлення оновлення"), "update.install",
-                 {{"path", downloaded["path"].toString()}, {"confirmed", true}},
-                 [launch](const QJsonObject &result) { launch(result["path"].toString()); });
-        }
-    });
+    const bool test = QCoreApplication::applicationName().endsWith("beta7-gassets");
+    QString systemLocal = local;
+    if (test) {
+        QDir dir(local);
+        for (int i = 0; i < 3; ++i)
+            dir.cdUp();
+        systemLocal = dir.absolutePath();
+    }
+    const auto key = QStringLiteral("HKEY_CURRENT_USER\\Software\\gAssets\\UpdateCenter") + (test ? ".test" : "");
+    QSettings registry(key, QSettings::NativeFormat);
+    const auto folder = test ? "gAssets-Test" : "gAssets";
+    const auto programRoot = registry.value("ProgramRoot", QDir(systemLocal).filePath(QString("Programs/") + folder)).toString();
+    const auto path = QDir(programRoot).filePath("UpdateCenter/gAssets.exe");
+    const bool installed = QFileInfo(path).isFile();
+    const auto stateRoot = QDir(systemLocal).filePath(QString(folder) + "/UpdateCenter/gtr-update-status.json");
+    QFile cache(stateRoot);
+    QJsonObject info;
+    if (installed && cache.open(QIODevice::ReadOnly) && cache.size() <= 16 * 1024)
+        info = QJsonDocument::fromJson(cache.readAll()).object();
+    update_->setVisible(info["available"].toBool());
+    if (info["available"].toBool())
+        update_->setText(B("Открыть обновление", "Відкрити оновлення"));
+    if (!prompt)
+        return;
+    if (!installed) {
+        status(B("gAssets доступен в общем установщике gTR. Для портативной копии откройте выпуски на GitHub.",
+                 "gAssets доступний у спільному інсталяторі gTR. Для портативної копії відкрийте випуски на GitHub."));
+    } else if (!QFileInfo(programRoot).isAbsolute() || !QProcess::startDetached(path, {}, QFileInfo(path).absolutePath())) {
+        status(B("Не удалось открыть gAssets. Новую версию можно скачать со страницы выпусков на GitHub.",
+                 "Не вдалося відкрити gAssets. Нову версію можна завантажити зі сторінки випусків на GitHub."));
+    }
 }
 
 void Window::task(const QString &name, const QString &method, const QJsonObject &params,
@@ -1199,7 +1436,7 @@ void Window::task(const QString &name, const QString &method, const QJsonObject 
     cancel_->show();
     pages_->setEnabled(false);
     status(name);
-    service_.send(method, params, [this, done = std::move(done)](const QJsonObject &value, const QString &error) {
+    service_.send(method, params, [this, method, done = std::move(done)](const QJsonObject &value, const QString &error) {
         progress_->hide();
         cancel_->hide();
         pages_->setEnabled(true);
@@ -1214,9 +1451,75 @@ void Window::task(const QString &name, const QString &method, const QJsonObject 
             setPlan(revised);
             status(fault(error));
         } else {
-            status(fault(error));
+            const auto issue = value["package_issue"].toObject();
+            const auto reason = issue.isEmpty() ? fault(error) :
+                (QSettings().value("language").toString() == "uk" ? fault(error) : issue["reason"].toString());
+            status(reason);
+            if (error != "CANCELLED") {
+                if (method.startsWith("import.")) {
+                    failedOperation_ = value["operation_id"].toString();
+                    rejectedMedia_ = error == "MEDIA_TYPE_CHANGED" || error == "MEDIA_INVALID" || error == "MEDIA_LOCAL_INVALID"
+                        ? value : QJsonObject{};
+                }
+                const auto stage = value["stage"].toString();
+                lastDiagnostic_ = {{"schema", 1}, {"redacted", false},
+                                   {"failure", QJsonObject{{"code", error}, {"stage", stage.isEmpty() ? method : stage},
+                                                           {"method", method}, {"reason", reason}}}};
+                saveDiagnostic_->show();
+                if (!issue.isEmpty()) {
+                    lastDiagnostic_["package_issue"] = issue;
+                    QStringList details{reason};
+                    for (const auto &[field, title] : {
+                             std::pair{"stage", B("Этап", "Етап")}, std::pair{"source_id", B("ID сообщения", "ID повідомлення")},
+                             std::pair{"file", B("Файл", "Файл")}, std::pair{"field", B("Поле", "Поле")},
+                             std::pair{"expected", B("Ожидалось", "Очікувалося")}, std::pair{"actual", B("Получено", "Отримано")},
+                         }) {
+                        const auto entry = issue[field].toVariant().toString();
+                        if (!entry.isEmpty())
+                            details.append(title + " · " + entry);
+                    }
+                    details.append(issue["action"].toString());
+                    diagnosis_->setText(details.join("\n"));
+                    status_->setToolTip(details.join("\n"));
+                    status(error + " · " + reason);
+                }
+                if (error == "PHONE_CODE_INVALID" || error == "PASSWORD_HASH_INVALID") {
+                    const auto password = error == "PASSWORD_HASH_INVALID";
+                    const auto retry = password ? B("Пароль отклонён. Ввести ещё раз?", "Пароль відхилено. Ввести ще раз?")
+                                                : B("Код отклонён. Ввести ещё раз?", "Код відхилено. Ввести ще раз?");
+                    if (QMessageBox::question(this, "Telegram", retry, QMessageBox::Yes | QMessageBox::No,
+                                              QMessageBox::No) == QMessageBox::Yes)
+                        answerLogin(method.startsWith("test.") ? "test" : "account",
+                                    {{"challenge", password ? "password" : "code"}});
+                }
+            }
         }
     });
+}
+
+void Window::saveValidationDiagnostic() {
+    if (lastDiagnostic_.isEmpty())
+        return;
+    auto path = QFileDialog::getSaveFileName(this, B("Сохранить диагностический отчёт", "Зберегти діагностичний звіт"),
+                                            "gTR-diagnostic.json", B("Отчёты JSON (*.json)", "Звіти JSON (*.json)"));
+    if (path.isEmpty())
+        return;
+    if (!path.endsWith(".json", Qt::CaseInsensitive))
+        path += ".json";
+    const auto absolute = QDir::cleanPath(QFileInfo(path).absoluteFilePath());
+    for (const auto &root : {project_, bundle_}) {
+        if (!root.isEmpty() && absolute.startsWith(QDir::cleanPath(QDir(root).absolutePath()) + "/", Qt::CaseInsensitive)) {
+            status(B("Сохраните отчёт отдельно от проекта и пакета.", "Збережіть звіт окремо від проєкту і пакета."));
+            return;
+        }
+    }
+    QSaveFile output(path);
+    const auto contents = QJsonDocument(lastDiagnostic_).toJson();
+    if (!output.open(QIODevice::WriteOnly) || output.write(contents) != contents.size() || !output.commit()) {
+        status(B("Не удалось сохранить диагностический отчёт.", "Не вдалося зберегти діагностичний звіт."));
+        return;
+    }
+    status(B("Диагностический отчёт сохранён.", "Діагностичний звіт збережено."));
 }
 
 void Window::status(const QString &message) { status_->setText(message); }
@@ -1232,6 +1535,36 @@ QString Window::fault(const QString &code) const {
         return B("Недостаточно места на диске.", "Недостатньо місця на диску.");
     if (code == "MEMORY_LIMIT")
         return B("Недостаточно памяти для задачи.", "Недостатньо пам’яті для завдання.");
+    if (code == "SELECTION_STALE")
+        return B("Выборка изменилась. Проверьте её и подготовьте новый пакет.", "Вибірка змінилася. Перевірте її та підготуйте новий пакет.");
+    if (code == "REPLAY_BLOCKED")
+        return B("Найдена предыдущая операция. Проверьте историю или подготовьте только новые записи.",
+                 "Знайдено попередню операцію. Перевірте історію або підготуйте лише нові записи.");
+    if (code == "TEST_RESET_REQUIRED")
+        return B("Выберите «Сбросить реестр тестовых импортов…» и подтвердите пустую историю на обоих аккаунтах.",
+                 "Виберіть «Скинути реєстр тестових імпортів…» і підтвердьте порожню історію на обох облікових записах.");
+    if (code == "TEST_PACKAGE_REQUIRED")
+        return B("Выберите «Подготовить тестовый пакет» для текущего тестового цикла.",
+                 "Виберіть «Підготувати тестовий пакет» для поточного тестового циклу.");
+    if (code == "TEST_HISTORY_NOT_EMPTY")
+        return B("У одного из аккаунтов в истории диалога ещё есть сообщения. Проверьте историю с обеих сторон.",
+                 "В одного з облікових записів в історії діалогу ще є повідомлення. Перевірте історію з обох сторін.");
+    if (code == "SAVED_DIALOG_UNAVAILABLE")
+        return B("Сохранённый диалог недоступен. Добавьте второй аккаунт в контакты Telegram и обновите список диалогов.",
+                 "Збережений діалог недоступний. Додайте другий обліковий запис до контактів Telegram і оновіть список діалогів.");
+    if (code == "START_UNCERTAIN")
+        return B("Ответ о запуске потерян. Сверьте историю обоих участников перед дальнейшими действиями.",
+                 "Відповідь про запуск втрачено. Звірте історію обох учасників перед наступними діями.");
+    if (code == "IPC_TIMEOUT")
+        return B("Истекло время ответа двигателя. Проверьте журнал перед продолжением.",
+                 "Вичерпано час очікування рушія. Перевірте журнал перед продовженням.");
+    if (code == "LOCAL_VALIDATION_FAILED")
+        return B("Движок остановил проверку пакета. Сохраните отчёт.", "Рушій зупинив перевірку пакета. Збережіть звіт.");
+    if (code == "MEDIA_TYPE_CHANGED" || code == "MEDIA_INVALID" || code == "MEDIA_LOCAL_INVALID")
+        return B("Вложение отклонено. Сохраните отчёт и проверьте способ подготовки.", "Вкладення відхилено. Збережіть звіт і перевірте спосіб підготовки.");
+    if (code == "FLOOD_WAIT")
+        return B("Telegram ограничил частоту запросов. Интервал ожидания указан в отчёте.",
+                 "Telegram обмежив частоту запитів. Інтервал очікування вказано у звіті.");
     if (code == "VERSION_MISMATCH")
         return B("Версии оболочки и службы различаются. Распакуйте полный комплект.", "Версії оболонки й служби різняться. Розпакуйте повний комплект.");
     if (code == "RECOVERY_ERROR" || code == "IO_ERROR")
@@ -1246,4 +1579,8 @@ void Window::closeEvent(QCloseEvent *event) {
     stopPlayer();
     service_.stop();
     QMainWindow::closeEvent(event);
+}
+
+Window::~Window() {
+    service_.stop();
 }

@@ -195,34 +195,51 @@ def _integer(value, limit):
     return type(value) is int and 0 < value <= limit
 
 
+class MediaInputError(ValueError):
+    def __init__(self, field, expected, actual):
+        self.field, self.expected, self.actual = field, expected, actual
+        super().__init__(field)
+
+
+def _attribute(condition, name, expected, actual):
+    if not condition:
+        raise MediaInputError(name, expected, actual)
+
+
 def _attribute_shape(details):
+    duration = details.get("duration")
     match details.get("type"):
         case "video":
-            duration = details.get("duration")
-            return (
-                type(duration) in (int, float)
-                and 0 < duration <= 7 * 86400
-                and _integer(details.get("width"), 16384)
-                and _integer(details.get("height"), 16384)
-                and type(details.get("round")) is bool
-                and all(type(details[k]) is bool for k in ("nosound", "supports_streaming") if k in details)
-                and (
-                    "video_codec" not in details
-                    or isinstance(details["video_codec"], str) and re.fullmatch(r"[a-z0-9_]{1,32}", details["video_codec"])
-                )
-            )
+            _attribute(type(duration) in (int, float) and 0 < duration <= 7 * 86400,
+                       "attributes.duration", "число секунд от 0 до 604800", duration)
+            for key in ("width", "height"):
+                value = details.get(key)
+                _attribute(_integer(value, 16384), "attributes." + key, "целое число от 1 до 16384", value)
+            for key in ("round", "nosound", "supports_streaming"):
+                if key == "round" or key in details:
+                    value = details.get(key)
+                    _attribute(type(value) is bool, "attributes." + key, "true или false", value)
+            if "video_codec" in details:
+                codec = details["video_codec"]
+                _attribute(isinstance(codec, str) and re.fullmatch(r"[a-z0-9_]{1,32}", codec),
+                           "attributes.video_codec", "идентификатор кодека", codec)
         case "audio":
-            return (
-                _integer(details.get("duration"), 7 * 86400) and type(details.get("voice")) is bool
-                and all(isinstance(details.get(key, ""), str) and len(details.get(key, "")) <= 128
-                        for key in ("title", "performer"))
-            )
+            _attribute(_integer(duration, 7 * 86400), "attributes.duration", "целое число секунд от 1 до 604800", duration)
+            flag = details.get("voice")
+            _attribute(type(flag) is bool, "attributes.voice", "true или false", flag)
+            for key in ("title", "performer"):
+                value = details.get(key, "")
+                _attribute(isinstance(value, str) and len(value) <= 128, "attributes." + key,
+                           "строка до 128 знаков", len(value) if isinstance(value, str) else type(value).__name__)
         case "animation":
-            return True
+            pass
         case "sticker":
-            return isinstance(emoji := details.get("emoji"), str) and len(emoji) <= 80
+            emoji = details.get("emoji")
+            _attribute(isinstance(emoji, str) and len(emoji) <= 80, "attributes.emoji",
+                       "строка до 80 знаков, включая пустую", emoji)
         case _:
-            return not details
+            _attribute(not details, "attributes.type", "video, audio, animation, sticker или пустые атрибуты",
+                       details.get("type"))
 
 
 def validate_media_input(item, path, *, strict=False):
@@ -230,20 +247,15 @@ def validate_media_input(item, path, *, strict=False):
     mime = item.get("mime")
     upload_as = item.get("upload_as")
     attrs = item.get("attributes", {})
-    if (
-        not isinstance(mime, str)
-        or len(mime) > 127
-        or not MIME_TYPE.fullmatch(mime)
-        or upload_as not in INPUT_MEDIA
-    ):
-        raise ValueError
-    if not isinstance(attrs, dict) or not _attribute_shape(attrs):
-        raise ValueError
-    if strict and (
-        item.get("input_media") != INPUT_MEDIA[upload_as] or item.get("compatibility") != "unverified"
-    ):
-        raise ValueError
+    _attribute(isinstance(mime, str) and len(mime) <= 127 and MIME_TYPE.fullmatch(mime),
+               "mime", "MIME в формате тип/подтип", mime)
+    _attribute(isinstance(upload_as, str) and upload_as in INPUT_MEDIA, "upload_as", "photo или document", upload_as)
+    _attribute(isinstance(attrs, dict), "attributes", "объект JSON", attrs)
+    _attribute_shape(attrs)
     if strict:
+        _attribute(item.get("input_media") == INPUT_MEDIA[upload_as], "input_media",
+                   INPUT_MEDIA[upload_as], item.get("input_media"))
+        _attribute(item.get("compatibility") == "unverified", "compatibility", "unverified", item.get("compatibility"))
         representation = (
             "photo"
             if upload_as == "photo"
@@ -255,20 +267,20 @@ def validate_media_input(item, path, *, strict=False):
             if item.get("source")
             else "generated_document"
         )
-        if item.get("representation") != representation:
-            raise ValueError
-    if "force_file" in item and type(item["force_file"]) is not bool:
-        raise ValueError
-    if item.get("force_file") and (attrs or upload_as == "photo"):
-        raise ValueError
+        _attribute(item.get("representation") == representation, "representation", representation, item.get("representation"))
+    force = item.get("force_file", False)
+    _attribute(type(force) is bool, "force_file", "true или false", force)
+    _attribute(not force or (not attrs and upload_as == "document"), "force_file",
+               "false для фото и медиа с атрибутами", force)
     claimed = item.get("detected_mime") if strict else ""
     if claimed or attrs or upload_as == "photo":
         with path.open("rb") as stream:
             actual, recognized = identify(path.name, stream.read(4096))
-        if not recognized or actual != mime or (claimed and claimed != actual):
-            raise ValueError
-    if upload_as == "photo" and (mime not in PHOTO_TYPES or attrs):
-        raise ValueError
+        _attribute(recognized and actual == mime, "mime", mime,
+                   actual if recognized else "формат по содержимому не подтверждён")
+        _attribute(not claimed or actual == claimed, "detected_mime", actual, claimed)
+    _attribute(upload_as != "photo" or (mime in PHOTO_TYPES and not attrs), "upload_as",
+               "фото JPEG/PNG без атрибутов документа", f"{upload_as}, {mime}")
     kind = item.get("kind")
     match attrs.get("type"):
         case "video" if kind not in {"video", "round_video"} or mime not in {
@@ -276,17 +288,17 @@ def validate_media_input(item, path, *, strict=False):
             "video/quicktime",
             "video/webm",
         }:
-            raise ValueError
+            raise MediaInputError("attributes.type", "видео MP4, QuickTime или WebM", f"{kind}, {mime}")
         case "audio" if kind not in {"audio", "voice"} or not mime.startswith("audio/"):
-            raise ValueError
+            raise MediaInputError("attributes.type", "аудио или голосовое вложение", f"{kind}, {mime}")
         case "animation" if kind != "animation" or mime not in {"video/mp4", "image/gif"}:
-            raise ValueError
+            raise MediaInputError("attributes.type", "анимация MP4 или GIF", f"{kind}, {mime}")
         case "sticker" if kind != "sticker" or mime not in {
             "image/webp",
             "video/webm",
             "application/x-tgsticker",
         }:
-            raise ValueError
+            raise MediaInputError("attributes.type", "стикер WebP, WebM или TGS", f"{kind}, {mime}")
 
 
 def copy_original(project, item, sink, progress):

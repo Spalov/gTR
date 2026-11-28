@@ -7,7 +7,7 @@
 
 #include <functional>
 
-inline constexpr int protocolVersion = 1;
+inline constexpr int protocolVersion = 2;
 inline constexpr qsizetype frameLimit = 1024 * 1024;
 
 QByteArray requestFrame(qint64 id, const QString &method, const QJsonObject &params);
@@ -39,6 +39,7 @@ private:
     const QString python_;
     QProcess process_;
     QTimer startup_;
+    QTimer inactivity_;
     QByteArray buffer_;
     qint64 sequence_ = 0;
     qint64 hello_ = 0;

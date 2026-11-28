@@ -62,6 +62,7 @@ from .conversion import LOSS, RECORD_KINDS, load_bundle, plan_import, prepare
 from .core import ISSUES, analyze, catalogue, properties, summary, verify
 from .dashboard import Dashboard, cat_art, label, number, panel, size_text
 from .diagnostics import Diagnostics
+from .faults import ImportFault
 from .fidelity import fidelity, public_fidelity
 from .files import local, publish_text
 from .gallery import PhotoGallery
@@ -81,10 +82,11 @@ from .media_queue_ui import CompatibilityDialog, QueueDisplay, media_size
 from .mock_api import SCENARIOS, rehearse
 from .model import Cancelled, RecoveryError
 from .owner import app_home
+from .package_errors import PackageValidationError
 from .recovery_ui import RecoveryResults
 from .registry_ui import HistoryPage, ProfilesPage
 from .reports import LOCAL, SERVER, plan_summary, save_report
-from .telegram_ui import TelegramControls
+from .telegram_ui import TelegramControls, package_error_text
 from .verification import FIELD_NAMES, VERDICTS, VERIFICATION_NAMES
 from .video import VIDEO_POLICIES, MediaTools, tool_path
 from .viewer import Viewer
@@ -211,6 +213,7 @@ class Worker(QThread):
     update = Signal(str, int, int)
     result = Signal(object)
     error = Signal(str)
+    validation_error = Signal(object)
     decision = Signal(object)
 
     def __init__(self, job, parent):
@@ -237,6 +240,8 @@ class Worker(QThread):
             self.result.emit(self.job(report))
         except MediaDecisionRequired as exc:
             self.decision.emit(exc)
+        except PackageValidationError as exc:
+            self.validation_error.emit(exc)
         except RecoveryError as exc:
             self.error.emit(str(exc))
         except Exception:  # noqa: BLE001 - keep details about local files out of the UI log
@@ -283,6 +288,7 @@ class Window(QMainWindow):
         self.planned = False
         self.after_job = None
         self.after_media_decision = None
+        self.job_fault = None
         self.pending_media_decision = None
         self.media_auto_controls = []
         self.close_pending = False
@@ -692,12 +698,14 @@ class Window(QMainWindow):
         self.bar.setValue(0)
         self.stop_btn = button(tr("Остановить"), self.stop_job)
         self.stop_btn.setEnabled(False)
+        self.job_diagnostic = button(tr("Сохранить диагностический отчёт…"), self.export_local_failure)
+        self.job_diagnostic.setEnabled(False)
         group.addWidget(self.job_title)
         group.addWidget(self.stage)
         group.addWidget(self.media_queue_display)
         group.addSpacing(8)
         group.addWidget(self.bar)
-        group.addLayout(row(self.stop_btn))
+        group.addLayout(row(self.stop_btn, self.job_diagnostic))
         layout.addWidget(box)
         self.outcome = label("", "secondary")
         self.outcome.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -837,7 +845,11 @@ class Window(QMainWindow):
         else:
             self.info("Выберите операцию в журнале.")
 
-    def save_operation_diagnostic(self, job):
+    def export_local_failure(self):
+        if self.job_fault:
+            self.save_operation_diagnostic(fallback=self.job_fault)
+
+    def save_operation_diagnostic(self, job=None, *, fallback=None):
         options = ("Обезличенный отчёт для передачи", "Локальный технический отчёт с ID сообщений и SHA-256")
         choice, ok = QInputDialog.getItem(self, "Диагностика операции", "Состав отчёта", options, 0, False)
         if not ok:
@@ -854,9 +866,21 @@ class Window(QMainWindow):
             protected = (*self.telegram._protected(), self.bundle)
             if any(dest.is_relative_to(local(Path(root))) for root in protected if root):
                 raise RecoveryError("Сохраните отчёт отдельно от исходных данных, проекта и пакета.")
-            data = Journal(app_home() / "imports.sqlite", "").diagnostic_report(
-                job, private=choice == options[1]
-            )
+            private = choice == options[1]
+            data = None
+            if job:
+                try:
+                    data = Journal(app_home() / "imports.sqlite", "").diagnostic_report(job, private=private)
+                except (OSError, RecoveryError, sqlite3.Error):
+                    if not fallback:
+                        raise
+            if data is None and fallback:
+                details = fallback.details(private=private)
+                data = {"schema": 1, "redacted": not private, "operation": None, "failure": details}
+                if "package_issue" in details:
+                    data["package_issue"] = details["package_issue"]
+            if data is None:
+                raise RecoveryError("Для выбранной попытки нет диагностических данных.")
             publish_text(dest, json.dumps(data, ensure_ascii=False, indent=2))
         except RecoveryError as exc:
             self.info(str(exc))
@@ -1771,10 +1795,13 @@ class Window(QMainWindow):
         self.after_job = ready
         self.after_media_decision = on_media_decision
         self.pending_media_decision = None
+        self.job_fault = None
+        self.job_diagnostic.setEnabled(False)
         self.worker = Worker(job, self)
         self.worker.update.connect(self.progress)
         self.worker.result.connect(self.job_done)
         self.worker.error.connect(self.job_error)
+        self.worker.validation_error.connect(self.job_validation_error)
         self.worker.decision.connect(self.job_waiting_for_media)
         self.worker.finished.connect(self.finished)
         self.job_title.setText(tr(title))
@@ -1811,7 +1838,14 @@ class Window(QMainWindow):
         if self.stage.text() != tr("Ограничение Telegram"):
             self.stage.setText(tr("Операция остановлена"))
         self.outcome.setText(tr(safe_message))
+        self.job_fault = ImportFault("LOCAL_INVALID", stage="local_check")
+        self.job_diagnostic.setEnabled(True)
         self.log(tr(safe_message))
+
+    def job_validation_error(self, error):
+        self.job_error(str(error))
+        self.job_fault = ImportFault.from_package(error)
+        self.outcome.setText(f"{error.code}\n{package_error_text(error.issue)}")
 
     def job_waiting_for_media(self, error):
         self.pending_media_decision = error

@@ -1,16 +1,18 @@
 """gTR by Gruzin."""
 
-BETA_NUMBER = 6
-BETA_FIX = True
+BETA_NUMBER = 7
+BETA_FIX = 0
 BETA_VERSION = (BETA_NUMBER, BETA_FIX)
 
 
-def beta_label(number, fix=False):
-    return f"Beta {number}" + (" (Fix)" if fix else "")
+def beta_label(number, fix=0):
+    suffix = f" (Fix {fix})" if fix > 1 else " (Fix)" if fix else ""
+    return f"Beta {number}{suffix}"
 
 
-def beta_folder(number, fix=False):
-    return f"gTR-Beta-{number}" + ("-Fix" if fix else "")
+def beta_folder(number, fix=0):
+    suffix = f"-Fix-{fix}" if fix > 1 else "-Fix" if fix else ""
+    return f"gTR-Beta-{number}{suffix}"
 
 
 __version__ = beta_label(*BETA_VERSION)

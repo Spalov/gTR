@@ -131,7 +131,7 @@ from gtr import BETA_FIX, BETA_NUMBER, __version__, updates
 file = Path(sys.argv[1])
 with file.open("rb") as stream:
     digest = file_digest(stream, "sha256").hexdigest()
-previous_beta = (BETA_NUMBER, False) if BETA_FIX else (BETA_NUMBER - 1, True)
+previous_beta = (BETA_NUMBER, BETA_FIX - 1) if BETA_FIX else (BETA_NUMBER - 1, True)
 assert updates.candidate(file, (BETA_NUMBER - 1, False)) is not None
 project = updates.app_home() / "projects" / "synthetic.txt"
 project.parent.mkdir(parents=True)

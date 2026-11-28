@@ -3,6 +3,7 @@
 from dataclasses import asdict, dataclass
 
 from .model import RecoveryError
+from .package_errors import PACKAGE_ERRORS, public_package_issue
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,12 @@ class FaultPolicy:
 
 
 POLICIES = {
+    **{code: FaultPolicy(message, message, action) for code, (message, action) in PACKAGE_ERRORS.items()},
+    "LOCAL_VALIDATION_FAILED": FaultPolicy(
+        "Движок остановил проверку пакета.",
+        "Нарушено ожидаемое состояние на указанном этапе проверки.",
+        "Сохраните обезличенный отчёт и повторите локальную проверку перед продолжением.",
+    ),
     "IMPORT_FORMAT_UNRECOGNIZED": FaultPolicy(
         "Telegram не распознал формат.",
         "Отказ распознавателя истории.",
@@ -37,6 +44,26 @@ POLICIES = {
     ),
     "PEER_ID_INVALID": FaultPolicy(
         "Целевой чат недоступен.", "Не удалось проверить идентификатор чата.", "Выберите доступный диалог."
+    ),
+    "SAVED_DIALOG_UNAVAILABLE": FaultPolicy(
+        "Telegram не вернул сохранённый личный диалог.",
+        "Список контактов не подтвердил, что сохранённый личный диалог доступен.",
+        "Добавьте второй аккаунт в контакты Telegram и снова откройте список диалогов.",
+    ),
+    "TEST_RESET_REQUIRED": FaultPolicy(
+        "Для тестового импорта нужно подтвердить пустую историю обоих аккаунтов.",
+        "Для выбранного личного диалога нет подтверждённого тестового цикла в текущем сеансе.",
+        "Выберите «Сбросить реестр тестовых импортов…» и подтвердите пустую историю на обоих аккаунтах.",
+    ),
+    "TEST_PACKAGE_REQUIRED": FaultPolicy(
+        "Для текущего тестового цикла нужен тестовый пакет.",
+        "Манифест пакета не связан с подтверждённым тестовым циклом.",
+        "Выберите «Подготовить тестовый пакет», затем снова проверьте пакет и диалог.",
+    ),
+    "TEST_HISTORY_NOT_EMPTY": FaultPolicy(
+        "У одного из аккаунтов в истории диалога ещё есть сообщения.",
+        "Сброс реестра доступен после проверки пустой истории с обеих сторон.",
+        "Проверьте историю на обоих тестовых аккаунтах и повторите проверку.",
     ),
     "PEER_TYPE": FaultPolicy(
         "Тип чата расходится с типом истории.",
@@ -179,11 +206,13 @@ class ImportFault(RecoveryError):
         stage: str = "",
         retry: str | None = None,
         response_constructor: str | None = None,
+        package_issue: dict | None = None,
     ):
         self.code, self.seconds, self.stage = code, seconds, stage
         self.policy = POLICIES[code]
         self.retry = retry or self.policy.retry
         self.response_constructor = response_constructor
+        self.package_issue = package_issue
         self.media_attempt: dict | None = None
         self.media_issues: list[dict] = []
         self.operation_id: str | None = None
@@ -196,7 +225,12 @@ class ImportFault(RecoveryError):
             stage=self.stage or stage,
             retry=self.retry,
             response_constructor=self.response_constructor,
+            package_issue=self.package_issue,
         )
+
+    @classmethod
+    def from_package(cls, error):
+        return cls(error.code, stage=error.stage, package_issue=error.details(private=True))
 
     def details(self, *, private=False) -> dict:
         result = {
@@ -219,4 +253,6 @@ class ImportFault(RecoveryError):
             result["media_attempt"] = self.media_attempt if private else redact_attempt(self.media_attempt)
         if self.media_issues:
             result["media_issue_count"] = len(self.media_issues)
+        if self.package_issue:
+            result["package_issue"] = self.package_issue if private else public_package_issue(self.package_issue)
         return result

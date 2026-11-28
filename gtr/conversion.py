@@ -1,5 +1,6 @@
 """Build an inspectable WhatsApp-style UTF-8 transcript and a local loss ledger."""
 
+import errno
 import hashlib
 import json
 import re
@@ -24,7 +25,6 @@ from .files import (
     local,
     new_directory,
     private_directory,
-    read_json,
     safe_parts,
 )
 from .history import (
@@ -48,8 +48,15 @@ from .media_recovery import (
     source_digest,
 )
 from .media_recovery import VERSION as MEDIA_WORKFLOW
-from .model import RecoveryError, quiet
-from .payloads import STRUCTURED, plan_media, publish_media, validate_media_input
+from .model import Cancelled, RecoveryError, quiet
+from .package_errors import PackageValidationError
+from .payloads import (
+    STRUCTURED,
+    MediaInputError,
+    plan_media,
+    publish_media,
+    validate_media_input,
+)
 from .profiles import MARKER, MEDIA_NAME, PROFILES, read_records, wire_line
 from .selection import decode_intervals, difference, included_intervals
 from .structure import (
@@ -649,6 +656,7 @@ def prepare(
     binding_version=BINDING_VERSION,
     media_workflow=None,
     reuse_records=None,
+    selection_snapshot=None,
 ):
     from .reports import package_html
 
@@ -692,7 +700,16 @@ def prepare(
             )
         if data.get("media_decisions_required"):
             raise MediaDecisionRequired(data["media_decisions_required"])
-        if record_ranges is not None:
+        if selection_snapshot is not None:
+            from .editor import check_snapshot
+
+            actual = included_intervals(data["records"])
+            if record_ranges is None or actual is None or difference(actual, decode_intervals(record_ranges)):
+                raise PackageValidationError("SELECTION_STALE", "write_package", "selection_snapshot")
+            data["selection"]["ranges"] = actual
+            data["selection_snapshot"] = selection_snapshot
+            check_snapshot(project, data, progress)
+        elif record_ranges is not None:
             actual = included_intervals(data["records"])
             reviewed = decode_intervals(record_ranges)
             if actual != reviewed:
@@ -714,13 +731,13 @@ def prepare(
             raise RecoveryError("Объём вложений превышает локальный предел пакета.")
         _require_space(work, sum(item["size"] for item in data["media"]
                                  if not item.get("transform") or item["name"] in reused_paths))
+        media_owners = {row["media"]: row for row in data["records"] if row.get("media")}
         for i, item in enumerate(data["media"], 1):
             path = work / "media" / item["storage_name"]
             if source := reused_paths.get(item["name"]):
                 checkpoint = lambda i=i: progress("media", i - 1, len(data["media"]))
-                _copy_bounded(source, path, item["size"], checkpoint)
-                if digest(path, checkpoint) != item["sha256"]:
-                    raise RecoveryError("Сохранённое вложение изменилось во время подготовки.")
+                _copy_bounded(source, path, item["size"], checkpoint, stage="write_package",
+                              file=item["name"], record=media_owners.get(item["name"]))
             elif item.get("transform"):
                 (work / ".video" / item["storage_name"]).replace(path)
             else:
@@ -730,10 +747,6 @@ def prepare(
                     path,
                     lambda i=i: progress("media", i - 1, len(data["media"])),
                 )
-            try:
-                validate_media_input(item, path, strict=True)
-            except ValueError:
-                raise RecoveryError(f"Локальная проверка вложения {item['name']} не пройдена.") from None
             progress("media", i, len(data["media"]))
         if (work / ".video").is_dir():
             (work / ".video").rmdir()
@@ -741,10 +754,11 @@ def prepare(
             raise RecoveryError("Объём вложений превышает локальный предел пакета.")
         with (work / "manifest.json").open("w", encoding="utf-8", newline="\n") as output:
             encode_manifest(data, output, progress)
+        checked = load_bundle(work, progress)
         (work / "report.html").write_text(package_html(data), encoding="utf-8")
         progress("finish", 1, 1)
     media_queue.settle(ready=True)
-    return Bundle(dest, data)
+    return Bundle(dest, checked.data)
 
 
 def prepare_eligible(
@@ -809,6 +823,7 @@ def prepare_eligible(
         record_kind=bundle.data.get("selection", {}).get("record_kind", "all"),
         media_workflow=True if repair or bundle.data.get("media_workflow") else None,
         reuse_records=originals,
+        selection_snapshot=bundle.data.get("selection_snapshot"),
     )
 
 
@@ -834,275 +849,386 @@ def encode_manifest(data, output, progress):
     output.write("}\n")
 
 
-def load_bundle(root, progress=quiet):
-    root = local(Path(root))
+def _package_field(valid, field, expected, actual, *, code="PACKAGE_SCHEMA_INVALID",
+                   stage="load_manifest", file="manifest.json", record=None):
+    if not valid:
+        raise PackageValidationError(code, stage, field, file=file, record=record, expected=expected, actual=actual)
+
+
+def _manifest(data, bundle):
+    _package_field(isinstance(data, dict), "manifest", "объект JSON", data)
+    for field, default, supported in (
+        ("schema", None, (1, 2, 3)), ("filename_version", 1, (1,)),
+        ("binding_version", 0, (0, BINDING_VERSION)), ("media_workflow", 0, (0, MEDIA_WORKFLOW)),
+    ):
+        value = data.get(field, default)
+        _package_field(type(value) is int and value in supported, field, ", ".join(map(str, supported)), value,
+                       code="UNSUPPORTED_PACKAGE_VERSION")
+    if data.get("binding_version") and not data.get("filename_version"):
+        raise AttachmentBindingError("filename_version", file="manifest.json", expected=1)
+    schema = data["schema"]
+    _package_field(data.get("profile") in PROFILES.values(), "profile", ", ".join(PROFILES.values()), data.get("profile"))
+    tz = data.get("timezone")
     try:
-        data = read_json(root / "manifest.json")
-        bundle = Bundle(root, data)
-        if (
-            data["schema"] not in {1, 2, 3}
-            or data.get("filename_version", 1) != 1
-            or data["profile"] not in PROFILES.values()
-            or local(bundle.transcript).stat().st_size > MAX_TOTAL_BYTES
-            or digest(bundle.transcript, lambda: progress("verify_text", 0, 0)) != data["text_sha256"]
-        ):
-            raise ValueError
-        if data["timezone"] != "source" or data["schema"] < 3:
-            ZoneInfo(data["timezone"])
-        if data["schema"] == 3 and data["date_policy"] not in DATE_POLICIES:
-            raise ValueError
-        if "test_reset_id" in data and (type(data["test_reset_id"]) is not int or data["test_reset_id"] < 0):
-            raise ValueError
-        modern = "media_mode" in data
-        workflow = data.get("media_workflow", 0)
-        if type(workflow) is not int or workflow not in (0, MEDIA_WORKFLOW):
-            raise ValueError
-        binding = data.get("binding_version", 0)
-        if type(binding) is not int or binding not in (0, BINDING_VERSION):
-            raise AttachmentBindingError()
-        if binding and not data.get("filename_version"):
-            raise AttachmentBindingError()
+        if tz != "source" or schema < 3:
+            ZoneInfo(tz)
+    except (TypeError, ValueError, ZoneInfoNotFoundError):
+        raise PackageValidationError("PACKAGE_SCHEMA_INVALID", "load_manifest", "timezone",
+                                     file="manifest.json", expected="часовой пояс IANA или source", actual=tz) from None
+    if schema == 3:
+        _package_field(data.get("date_policy") in DATE_POLICIES, "date_policy", "известный режим даты", data.get("date_policy"))
+    if "test_reset_id" in data:
+        value = data["test_reset_id"]
+        _package_field(type(value) is int and value >= 0, "test_reset_id", "целое число от 0", value)
+    for field in ("records", "media"):
+        value = data.get(field)
+        _package_field(isinstance(value, list) and all(isinstance(entry, dict) for entry in value),
+                       field, "массив объектов JSON", value)
+    for field in ("included", "skipped", "chat_id"):
+        value = data.get(field)
+        _package_field(type(value) is int and (field == "chat_id" or value >= 0), field, "целое число", value)
+    for field in ("source_sha256", "text_sha256"):
+        value = data.get(field)
+        _package_field(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value), field, "SHA-256", value)
+    losses = data.get("losses")
+    _package_field(isinstance(losses, dict) and all(type(v) is int and v >= 0 for v in losses.values()),
+                   "losses", "неотрицательные счётчики", losses)
+    records = data["records"]
+    previous = 0
+    for row in records:
+        _package_field(isinstance(row.get("media", ""), str), "records.media", "имя вложения", row.get("media"), record=row)
+        _package_field("included" in row, "records.included", "признак включения", None, record=row)
+        for field in ("video_recovery", "media_recovery"):
+            value = row.get(field)
+            if value:
+                _package_field(isinstance(value, dict), field, "решение JSON", value, record=row)
+                key = value.get("key")
+                _package_field(key is None or isinstance(key, str), field + ".key", "ключ решения", key, record=row)
         if "filename_version" in data:
-            if type(data.get("source_title_unique", True)) is not bool or not re.fullmatch(
-                r"(?:(?:user|chat|channel)-?[1-9]\d{0,18})?", data.get("source_conversation", "")
-            ):
-                raise ValueError
-            previous = 0
-            for record in data["records"]:
-                pos = record["source_ordinal"]
-                if (
-                    type(pos) is not int
-                    or not previous < pos <= 2**31 - 1
-                    or not isinstance(record["source_id"], str)
-                    or not isinstance(record["source_identity"], dict)
-                    or not isinstance(record["original_media"], list)
-                    or any(not isinstance(a, dict) for a in record["original_media"])
-                    or not re.fullmatch(r"[a-f0-9]{64}", record["original_text_sha256"])
-                ):
-                    raise ValueError
-                previous=pos
-        mode = data.get("media_mode", "text_media")
-        choices = validate_decisions(data.get("video_decisions"))
-        converted = {
-            row.get("media") for row in data["records"]
-            if (decision := row.get("video_recovery")) and decision.get("action") == "convert"
-            and choices.get(decision.get("key")) in {"compatible", "reencode", "remux", "fidelity", "compact"}
-        }
-        images = {
-            row.get("media"): decision for row in data["records"]
-            if (decision := row.get("media_recovery")) and decision.get("action") == "image"
-            and choices.get(decision.get("key")) == "image"
-        }
-        if data.get("video_policy") not in (None, *VIDEO_POLICIES):
-            raise ValueError
-        if (
-            type(data["chat_id"]) is not int
-            or not re.fullmatch(r"[a-f0-9]{64}", data["source_sha256"])
-            or not isinstance(data["records"], list)
-            or not isinstance(data["losses"], dict)
-            or any(not isinstance(k, str) or type(v) is not int or v < 0 for k, v in data["losses"].items())
-            or not isinstance(data["media"], list)
-            or type(data["included"]) is not int
-            or type(data["skipped"]) is not int
-            or (
-                modern
-                and (
-                    mode not in MEDIA_MODES
-                    or data["source_records"] != len(data["records"])
-                    or data["media_count"] != len(data["media"])
-                    or data.get("fixture") not in (None, "text", "media")
-                    or (
-                        mode == "text_only"
-                        and (
-                            data["media"]
-                            or any(
-                                r["omitted_media_count"] != len(r["original_media"]) for r in data["records"]
-                            )
-                            or data["omitted_assets"]
-                            != sum(r["omitted_media_count"] for r in data["records"])
-                        )
-                    )
-                )
-            )
-        ):
-            raise ValueError
-        if "selection" in data:
-            selection = data["selection"]
-            first, last, sample = (selection[k] for k in ("first_record", "last_record", "sample"))
-            selected = data["selected_records"]
-            if (
-                selection.get("record_kind", "all") not in RECORD_KINDS
-                or type(first) is not int
-                or not 1 <= first <= 2**31 - 1
-                or (last is not None and (type(last) is not int or not first <= last <= 2**31 - 1))
-                or (sample is not None and (type(sample) is not int or sample < max(1, data["included"])))
-                or type(selected) is not int
-                or not data["included"] <= selected <= len(data["records"])
-                or any(
-                    not first <= r["source_ordinal"] <= (last or 2**31 - 1)
-                    for r in data["records"]
-                    if r["included"]
-                )
-            ):
-                raise ValueError
-            if "ranges" in selection and decode_intervals(selection["ranges"]) != bundle.record_intervals():
-                raise ValueError
-        names, stored, planned, media_by_name = set(), set(), [], {}
-        total_bytes = 0
-        for i, item in enumerate(data["media"], 1):
-            progress("verify", i, len(data["media"]))
-            name = item["name"]
-            if (
-                not isinstance(name, str)
-                or not name
-                or safe_filename(name) != name
-                or name.casefold() in names
-                or item.get("storage_name", name) in stored
-                or (
-                    not data.get("filename_version")
-                    and any(k in item for k in ("storage_name", "display_name", "filename_source"))
-                )
-                or (
-                    data.get("filename_version") == 1
-                    and (
-                        not item.get("display_name")
-                        or safe_filename(item["display_name"]) != item["display_name"]
-                        or item.get("filename_source")
-                        not in {"export_metadata", "export_basename", "generated"}
-                        or "storage_name" not in item
-                    )
-                )
-                or not isinstance(item["kind"], str)
-                or type(item["size"]) is not int
-                or item["size"] <= 0
-                or not re.fullmatch(r"[a-f0-9]{64}", item["sha256"])
-                or (
-                    mode == "document"
-                    and (
-                        item["upload_as"] != "document"
-                        or item.get("attributes")
-                        or (item["source"] and not item.get("force_file"))
-                    )
-                )
-            ):
-                raise ValueError
-            path = bundle.media_path(item)
-            total_bytes += item["size"]
-            if total_bytes > MAX_TOTAL_BYTES:
-                raise ValueError
-            transform = item.get("transform")
-            if transform:
-                if not isinstance(transform, dict) or not re.fullmatch(r"[a-f0-9]{64}", transform.get("original_sha256", "")):
-                    raise ValueError
-                if transform.get("type") == "png_image":
-                    decision = images.get(name)
-                    if (
-                        not workflow or not decision or item["mime"] != "image/png"
-                        or type(decision.get("alpha")) is not bool or item.get("force_file") is not decision["alpha"]
-                        or transform["original_sha256"] != decision.get("original_sha256")
-                        or any(item[key] != decision.get(key) for key in ("size", "sha256"))
-                    ):
-                        raise ValueError
-                elif (
-                    transform.get("type") != "mp4_h264_aac" or item["mime"] != "video/mp4"
-                    or (data.get("video_policy") not in {"compatible", "remux", "fidelity", "compact"} and name not in converted)
-                    or item.get("attributes", {}).get("video_codec") != "h264"
-                ):
-                    raise ValueError
+            position = row.get("source_ordinal")
+            _package_field(type(position) is int and previous < position <= 2**31 - 1,
+                           "source_ordinal", f"номер после {previous}", position, record=row)
+            previous = position
+            for field, kind in (("source_id", str), ("source_identity", dict), ("original_media", list)):
+                _package_field(isinstance(row.get(field), kind), field, kind.__name__, row.get(field), record=row)
+            value = row.get("original_text_sha256")
+            _package_field(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value),
+                           "original_text_sha256", "SHA-256", value, record=row)
+            _package_field(all(isinstance(a, dict) for a in row["original_media"]),
+                           "original_media", "массив объектов JSON", row["original_media"], record=row)
+    if "filename_version" in data:
+        conversation = data.get("source_conversation", "")
+        _package_field(isinstance(conversation, str)
+                       and re.fullmatch(r"(?:(?:user|chat|channel)-?[1-9]\d{0,18})?", conversation),
+                       "source_conversation", "идентификатор диалога или пустая строка", conversation)
+        _package_field(type(data.get("source_title_unique", True)) is bool,
+                       "source_title_unique", "true или false", data.get("source_title_unique"))
+    mode = data.get("media_mode", "text_media")
+    if "media_mode" in data:
+        _package_field(isinstance(mode, str) and mode in MEDIA_MODES, "media_mode", "известный режим", mode)
+        for field, amount in (("media_count", len(data["media"])), ("source_records", len(records))):
+            _package_field(data.get(field) == amount, field, amount, data.get(field))
+        _package_field(data.get("fixture") in (None, "text", "media"), "fixture", "text, media или пустое поле", data.get("fixture"))
+        if mode == "text_only":
+            _package_field(not data["media"], "media_count", 0, len(data["media"]))
+            for row in records:
+                expected = len(row["original_media"])
+                _package_field(row.get("omitted_media_count") == expected, "omitted_media_count",
+                               expected, row.get("omitted_media_count"), record=row)
+            expected = sum(row["omitted_media_count"] for row in records)
+            _package_field(data.get("omitted_assets") == expected, "omitted_assets", expected, data.get("omitted_assets"))
+    policy = data.get("video_policy")
+    _package_field(policy in (None, *VIDEO_POLICIES), "video_policy", "известный профиль", policy)
+    if "selection" in data:
+        selection = data["selection"]
+        _package_field(isinstance(selection, dict), "selection", "объект JSON", selection)
+        first, last, sample = (selection[k] for k in ("first_record", "last_record", "sample"))
+        _package_field(selection.get("record_kind", "all") in RECORD_KINDS,
+                       "selection.record_kind", "известный тип записи", selection.get("record_kind"))
+        _package_field(type(first) is int and 1 <= first <= 2**31 - 1, "selection.first_record", "положительный номер", first)
+        _package_field(last is None or type(last) is int and first <= last <= 2**31 - 1,
+                       "selection.last_record", f"номер от {first} или пустое поле", last)
+        _package_field(sample is None or type(sample) is int and sample >= max(1, data["included"]),
+                       "selection.sample", f"не меньше {data['included']} или пустое поле", sample)
+        selected = data.get("selected_records")
+        _package_field(type(selected) is int and data["included"] <= selected <= len(records),
+                       "selected_records", f"от {data['included']} до {len(records)}", selected)
+        for row in records:
+            if row["included"]:
+                pos = row.get("source_ordinal")
+                _package_field(type(pos) is int and first <= pos <= (last or 2**31 - 1),
+                               "source_ordinal", f"в диапазоне {first}–{last or 2**31 - 1}", pos, record=row)
+        if "ranges" in selection:
             try:
-                validate_media_input(item, path, strict=modern)
-                if (path.stat().st_size != item["size"]
-                        or digest(path, lambda i=i: progress("verify", i, len(data["media"]))) != item["sha256"]):
-                    raise ValueError
-            except (ValueError, OSError):
-                if binding:
-                    raise AttachmentBindingError() from None
-                raise
-            names.add(name.casefold())
-            stored.add(item.get("storage_name", name))
-            planned.append(wire_name(item))
-            media_by_name[name] = (i, item)
-        markers, headers = [], 0
-        expected = iter(r for r in data["records"] if r["included"])
-        previous_position, previous_date = 0, ""
-        with local(bundle.transcript).open(encoding="utf-8", newline="\n") as text:
-            for wire_date, author, body, name in read_records(text, data["profile"]):
-                headers += 1
-                if name:
-                    markers.append(name)
-                if mode == "text_only" and not body.strip():
-                    raise ValueError
-                row = next(expected, None)
-                if not row:
-                    raise ValueError
-                media_reference = row.get("media", "")
-                asset = media_by_name.get(media_reference)
-                expected_marker = wire_name(asset[1]) if asset else media_reference
-                if binding and (name != expected_marker or (media_reference and not asset)
-                                or (not asset and "attachment_id" in row)):
-                    raise AttachmentBindingError()
-                if (
-                    data["schema"] >= 2
-                    and (
-                        row["author"] != author
-                        or expected_marker != name
-                        or row["text_sha256"] != hashlib.sha256(body.encode("utf-8")).hexdigest()
-                    )
-                ):
-                    raise ValueError
-                if data["schema"] >= 2:
-                    wire_fmt = "%d/%m/%Y, %H:%M:%S" if data["profile"] == PROFILE else "%d/%m/%y, %H:%M:%S"
-                    date = datetime.fromisoformat(row["import_date"])
-                    if binding and asset:
-                        check_binding(data, row, asset[1], asset[0], date)
-                    if (
-                        date.strftime(wire_fmt) != wire_date
-                        or (
-                            (data["schema"] == 2 or data["date_policy"] == "ordered")
-                            and row["import_date"] <= previous_date
-                        )
-                        or type(row["source_ordinal"]) is not int
-                        or row["source_ordinal"] <= previous_position
-                        or row["ordinal"] != headers
-                    ):
-                        raise ValueError
-                    previous_date, previous_position = row["import_date"], row["source_ordinal"]
-        marker_mismatch = len(markers) != len(names) or (
-            markers != planned if modern else {marker.casefold() for marker in markers} != names
-        )
-        if binding and (marker_mismatch or len(set(planned)) != len(planned)):
-            raise AttachmentBindingError()
-        if (
-            headers != data["included"]
-            or marker_mismatch
-            or sum(bool(r["included"]) for r in data["records"]) != headers
-            or len(data["records"]) - headers != data["skipped"]
-            or not isinstance(data["losses"], dict)
-            or not isinstance(data["timezone"], str)
+                matched = decode_intervals(selection["ranges"]) == bundle.record_intervals()
+            except (TypeError, ValueError):
+                matched = False
+            _package_field(matched, "selection.ranges", "диапазоны включённых записей", selection["ranges"])
+    if "selection_snapshot" in data:
+        value = data["selection_snapshot"]
+        keys = {"schema", "project_id", "preset", "revision", "project_sha256", "ranges_sha256"}
+        valid = (schema == 3 and isinstance(value, dict) and value.keys() == keys
+                 and "ranges" in data.get("selection", {}) and type(value["schema"]) is int and value["schema"] == 1
+                 and all(isinstance(value[k], str) and re.fullmatch(r"[a-f0-9]{64}", value[k])
+                         for k in ("project_id", "project_sha256", "ranges_sha256"))
+                 and isinstance(value["preset"], str) and len(value["preset"]) <= 80
+                 and not any(ord(c) < 32 for c in value["preset"])
+                 and isinstance(value["revision"], str)
+                 and re.fullmatch(r"initial|[a-f0-9]{32}", value["revision"]))
+        _package_field(valid, "selection_snapshot", "снимок выборки схемы 1", value)
+
+
+def _file_error(error, stage, file, *, record=None):
+    missing = isinstance(error, FileNotFoundError)
+    return PackageValidationError("FILE_NOT_FOUND" if missing else "PACKAGE_IO_ERROR", stage,
+                                  "file", file=file, record=record, expected="доступный локальный файл",
+                                  actual="отсутствует" if missing else getattr(error, "winerror", None) or error.errno)
+
+
+def _media_ledger(bundle, progress):
+    data = bundle.data
+    try:
+        choices = validate_decisions(data.get("video_decisions"))
+    except RecoveryError:
+        raise PackageValidationError("PACKAGE_SCHEMA_INVALID", "load_manifest", "video_decisions",
+                                     file="manifest.json", expected="известные решения по вложениям",
+                                     actual=data.get("video_decisions")) from None
+    records = {row["media"]: row for row in data["records"] if row.get("media")}
+    names, stored, planned, media_by_name = set(), set(), [], {}
+    total_bytes = 0
+    for i, item in enumerate(data["media"], 1):
+        progress("verify", i, len(data["media"]))
+        name = item.get("name")
+        storage = item.get("storage_name", name)
+        record = records.get(name, {}) if isinstance(name, str) else {}
+        if not name or not isinstance(name, str) or safe_filename(name) != name or name.casefold() in names:
+            raise AttachmentBindingError("name", file=name, record=record, expected="уникальное безопасное имя", actual=name)
+        if not isinstance(storage, str) or not MEDIA_NAME.fullmatch(storage) or storage.casefold() in stored:
+            raise AttachmentBindingError("storage_name", file=name, record=record, expected="уникальное локальное имя", actual=storage)
+        marker = wire_name(item)
+        if not isinstance(marker, str):
+            raise AttachmentBindingError("wire_name", file=name, record=record, expected="имя для привязки", actual=marker)
+        named = "filename_version" in data
+        if named:
+            display = item.get("display_name")
+            if ("storage_name" not in item or not display or safe_filename(display) != display
+                    or item.get("filename_source") not in {"export_metadata", "export_basename", "generated"}):
+                raise AttachmentBindingError("display_name", file=name, record=record, expected="имя из экспорта или сгенерированное",
+                                             actual=display)
+        elif any(k in item for k in ("storage_name", "display_name", "filename_source")):
+            raise AttachmentBindingError("filename_version", file=name, record=record, expected=1)
+        stage = "verify_media"
+        for field, valid, expected in (
+            ("kind", isinstance(item.get("kind"), str), "тип вложения"),
+            ("size", type(item.get("size")) is int and item["size"] > 0, "положительный размер в байтах"),
+            ("sha256", isinstance(item.get("sha256"), str) and re.fullmatch(r"[a-f0-9]{64}", item["sha256"]), "SHA-256"),
         ):
-            raise ValueError
+            _package_field(valid, field, expected, item.get(field), stage=stage, file=name, record=record)
+        total_bytes += item["size"]
+        _package_field(total_bytes <= MAX_TOTAL_BYTES, "media_total_bytes", MAX_TOTAL_BYTES, total_bytes,
+                       stage=stage, file=name, record=record)
+        try:
+            path = bundle.media_path(item)
+            size = path.stat().st_size
+            _package_field(size == item["size"], "size", item["size"], size, code="MEDIA_HASH_MISMATCH",
+                           stage=stage, file=name, record=record)
+            actual = digest(path, lambda i=i: progress("verify", i, len(data["media"])))
+            _package_field(actual == item["sha256"], "sha256", item["sha256"], actual, code="MEDIA_HASH_MISMATCH",
+                           stage=stage, file=name, record=record)
+            validate_media_input(item, path, strict="media_mode" in data)
+        except OSError as error:
+            raise _file_error(error, stage, name, record=record) from None
+        except MediaInputError as error:
+            raise PackageValidationError("MEDIA_ATTRIBUTES_INVALID", stage, error.field, file=name, record=record,
+                                         expected=error.expected, actual=error.actual) from None
+        if data.get("media_mode") == "document":
+            for field, value, expected in (
+                ("upload_as", item["upload_as"], "document"), ("attributes", bool(item.get("attributes")), False),
+                ("force_file", bool(item.get("force_file")) or not item.get("source"), True),
+            ):
+                _package_field(value == expected, field, expected, value, code="MEDIA_ATTRIBUTES_INVALID",
+                               stage=stage, file=name, record=record)
+        _validate_transform(data, item, record, choices)
+        names.add(name.casefold())
+        stored.add(storage.casefold())
+        planned.append(marker)
+        media_by_name[name] = (i, item)
+    return names, planned, media_by_name
+
+
+def _validate_transform(data, item, row, choices):
+    transform = item.get("transform")
+    if not transform:
+        return
+    source_hash = transform.get("original_sha256") if isinstance(transform, dict) else None
+    context = {"code": "MEDIA_ATTRIBUTES_INVALID", "stage": "verify_media", "file": item["name"], "record": row}
+    _package_field(isinstance(source_hash, str) and re.fullmatch(r"[a-f0-9]{64}", source_hash),
+                   "transform.original_sha256", "SHA-256 оригинала", source_hash, **context)
+    if transform.get("type") == "png_image":
+        decision = row.get("media_recovery")
+        valid = (isinstance(decision, dict) and decision.get("action") == "image"
+                 and choices.get(decision.get("key")) == "image"
+                 and data.get("media_workflow") and item["mime"] == "image/png"
+                 and type(decision.get("alpha")) is bool and item.get("force_file") is decision["alpha"]
+                 and source_hash == decision.get("original_sha256")
+                 and all(item[key] == decision.get(key) for key in ("size", "sha256")))
+        expected = "PNG, соответствующий решению по исходному файлу"
+    else:
+        decision = row.get("video_recovery", {})
+        converted = (isinstance(decision, dict) and decision.get("action") == "convert"
+                     and choices.get(decision.get("key")) in {"compatible", "reencode", "remux", "fidelity", "compact"})
+        valid = (transform.get("type") == "mp4_h264_aac" and item["mime"] == "video/mp4"
+                 and (data.get("video_policy") in {"compatible", "remux", "fidelity", "compact"} or converted)
+                 and item.get("attributes", {}).get("video_codec") == "h264")
+        expected = "MP4 H.264, соответствующий решению по исходному видео"
+    _package_field(valid, "transform", expected, transform.get("type"), **context)
+
+
+def _transcript(bundle, names, planned, media_by_name):
+    data = bundle.data
+    include = iter(row for row in data["records"] if row["included"])
+    headers, markers, previous_position, previous_date = 0, [], 0, ""
+    binding = data.get("binding_version", 0)
+    with local(bundle.transcript).open(encoding="utf-8", newline="\n") as stream:
+        for stamp, author, body, marker in read_records(stream, data["profile"]):
+            headers += 1
+            if marker:
+                markers.append(marker)
+            row = next(include, None)
+            ctx = {"stage": "verify_text", "file": "_chat.txt", "record": row}
+            _package_field(row is not None, "included", data["included"], headers, **ctx)
+            reference = row.get("media", "")
+            asset = media_by_name.get(reference)
+            expected = wire_name(asset[1]) if asset else reference
+            if ((binding or data["schema"] >= 2) and marker != expected
+                    or binding and (reference and not asset or not asset and "attachment_id" in row)):
+                raise AttachmentBindingError("attached", file=reference or "_chat.txt", record=row,
+                                             expected=expected, actual=marker)
+            if data.get("media_mode") == "text_only":
+                _package_field(bool(body.strip()), "text_only", "непустая запись", "пустая запись", **ctx)
+            if data["schema"] >= 2:
+                code = "MANIFEST_MISMATCH"
+                _package_field(row["author"] == author, "author", "автор из манифеста", "имя расходится", code=code, **ctx)
+                body_hash = hashlib.sha256(body.encode()).hexdigest()
+                _package_field(row["text_sha256"] == body_hash, "text_sha256", row["text_sha256"], body_hash, code=code, **ctx)
+                try:
+                    date = datetime.fromisoformat(row.get("import_date"))
+                except (TypeError, ValueError):
+                    raise PackageValidationError("PACKAGE_SCHEMA_INVALID", "verify_text", "import_date",
+                                                 file="_chat.txt", record=row, expected="дата и время ISO 8601",
+                                                 actual=row.get("import_date")) from None
+                fmt = "%d/%m/%Y, %H:%M:%S" if data["profile"] == PROFILE else "%d/%m/%y, %H:%M:%S"
+                if binding and asset:
+                    check_binding(data, row, asset[1], asset[0], date)
+                _package_field(date.strftime(fmt) == stamp, "import_date", date.strftime(fmt), stamp, code=code, **ctx)
+                position = row["source_ordinal"]
+                ordered = data["schema"] == 2 or data["date_policy"] == "ordered"
+                _package_field(not ordered or row["import_date"] > previous_date,
+                               "import_date", "дата после " + previous_date, row["import_date"], **ctx)
+                _package_field(type(position) is int and position > previous_position,
+                               "source_ordinal", f"после {previous_position}", position, **ctx)
+                _package_field(row["ordinal"] == headers, "ordinal", headers, row["ordinal"], **ctx)
+                previous_date, previous_position = row["import_date"], position
+    matched = markers == planned if "media_mode" in data else {marker.casefold() for marker in markers} == names
+    if len(markers) != len(names) or not matched or binding and len(set(planned)) != len(planned):
+        raise AttachmentBindingError("attached", file="_chat.txt", expected=f"{len(names)} точных привязок в порядке записей",
+                                     actual=f"{len(markers)} маркеров")
+    included = sum(bool(row["included"]) for row in data["records"])
+    for field, expected, actual in (
+        ("included", data["included"], headers), ("records.included", headers, included),
+        ("skipped", data["skipped"], len(data["records"]) - headers),
+    ):
+        _package_field(expected == actual, field, expected, actual, stage="verify_text", file="_chat.txt")
+
+
+def _read_package_manifest(root, stage="load_manifest"):
+    file = "manifest.json"
+    try:
+        path = local(root / file)
+        size = path.stat().st_size
+        _package_field(size <= 128 * 1024**2, "manifest_size", 128 * 1024**2, size, stage=stage)
+        with path.open(encoding="utf-8-sig") as stream:
+            return json.load(stream)
+    except (PackageValidationError, Cancelled):
+        raise
+    except OSError as error:
+        raise _file_error(error, stage, file) from None
+    except RecoveryError as error:
+        raise PackageValidationError("PACKAGE_IO_ERROR", stage, "file", file=file,
+                                     expected="доступный локальный файл", reason=str(error)) from None
+    except (UnicodeError, ValueError) as error:
+        raise PackageValidationError("PACKAGE_SCHEMA_INVALID", stage, "manifest", file=file,
+                                     expected="манифест JSON в UTF-8", actual=type(error).__name__) from None
+
+
+def check_manifest_identity(bundle, stage):
+    data = _read_package_manifest(bundle.root, stage)
+    actual = hashlib.sha256(encode(data).encode()).hexdigest()
+    expected = bundle.manifest_hash()
+    _package_field(expected == actual, "manifest_sha256", expected, actual, code="MANIFEST_MISMATCH", stage=stage)
+
+
+def load_bundle(root, progress=quiet):
+    stage, file = "load_manifest", "manifest.json"
+    try:
+        root = local(Path(root))
+        data = _read_package_manifest(root, stage)
+        bundle = Bundle(root, data)
+        _manifest(data, bundle)
+        stage, file = "verify_text", "_chat.txt"
+        text = local(bundle.transcript)
+        size = text.stat().st_size
+        _package_field(size <= MAX_TOTAL_BYTES, "text_size", MAX_TOTAL_BYTES, size, stage=stage, file=file)
+        actual = digest(text, lambda: progress("verify_text", 0, 0))
+        _package_field(actual == data["text_sha256"], "text_sha256", data["text_sha256"], actual,
+                       code="MANIFEST_MISMATCH", stage=stage, file=file)
+        stage, file = "verify_media", "manifest.json"
+        names, planned, media_by_name = _media_ledger(bundle, progress)
+        stage, file = "verify_text", "_chat.txt"
+        _transcript(bundle, names, planned, media_by_name)
         return bundle
-    except (ValueError, KeyError, TypeError, OSError, UnicodeError, ZoneInfoNotFoundError, AttributeError):
-        raise RecoveryError("Пакет неполон, изменён или имеет неизвестный формат.") from None
+    except (PackageValidationError, Cancelled):
+        raise
+    except OSError as error:
+        raise _file_error(error, stage, file) from None
+    except RecoveryError as error:
+        raise PackageValidationError("PACKAGE_IO_ERROR", stage, "file", file=file,
+                                     expected="доступный локальный файл", reason=str(error)) from None
+    except (ValueError, KeyError, TypeError, UnicodeError, AttributeError) as error:
+        field = error.args[0] if isinstance(error, KeyError) else "transcript" if stage == "verify_text" else "manifest"
+        raise PackageValidationError("PACKAGE_SCHEMA_INVALID", stage, field, file=file,
+                                     expected="данные пакета по схеме gTR", actual=type(error).__name__) from None
 
 
-def _require_space(path, size):
-    if shutil.disk_usage(path).free < size:
-        raise RecoveryError("Недостаточно места на диске для копирования пакета.")
+def _require_space(path, size, stage="write_package"):
+    free = shutil.disk_usage(path).free
+    if free < size:
+        raise PackageValidationError("PACKAGE_STORAGE_INSUFFICIENT", stage, "free_bytes",
+                                     file=path.anchor.rstrip("/\\") or path, expected=size, actual=free)
 
 
-def _copy_bounded(source, destination, size, checkpoint):
-    with local(source).open("rb") as reader, destination.open("xb") as writer:
-        remaining = size
-        while remaining:
-            checkpoint()
-            chunk = reader.read(min(BLOCK, remaining))
-            if not chunk:
-                raise RecoveryError("Пакет изменился во время копирования.")
-            writer.write(chunk)
-            remaining -= len(chunk)
-        if reader.read(1):
-            raise RecoveryError("Пакет изменился во время копирования.")
+def _copy_bounded(source, destination, size, checkpoint, *, stage="copy_snapshot", record=None, file=None):
+    file = file or source.name
+    code = "MANIFEST_MISMATCH" if source.name == "_chat.txt" else "MEDIA_HASH_MISMATCH"
+    remaining = size
+    try:
+        with local(source).open("rb") as reader, destination.open("xb") as writer:
+            while remaining:
+                checkpoint()
+                chunk = reader.read(min(BLOCK, remaining))
+                if not chunk:
+                    raise PackageValidationError(code, stage, "size", file=file, record=record,
+                                                 expected=size, actual=size - remaining)
+                writer.write(chunk)
+                remaining -= len(chunk)
+            if reader.read(1):
+                raise PackageValidationError(code, stage, "size", file=file, record=record, expected=size,
+                                             actual=f"не менее {size + 1}")
+    except OSError as error:
+        if error.errno == errno.ENOSPC or getattr(error, "winerror", None) in (39, 112):
+            raise PackageValidationError("PACKAGE_STORAGE_INSUFFICIENT", stage, "free_bytes", file=file, record=record,
+                                         expected=max(1, remaining), actual=shutil.disk_usage(destination.parent).free) from None
+        raise _file_error(error, stage, file, record=record) from None
 
 
 @contextmanager
@@ -1117,12 +1243,16 @@ def owner_copy(bundle, progress=quiet):
 
 def copy_package(bundle, root, progress):
     manifest = encode(bundle.data).encode("utf-8")
-    transcript_size = local(bundle.transcript).stat().st_size
+    try:
+        transcript_size = local(bundle.transcript).stat().st_size
+    except OSError as error:
+        raise _file_error(error, "copy_snapshot", "_chat.txt") from None
     required = len(manifest) + transcript_size + sum(item["size"] for item in bundle.data["media"])
-    _require_space(root, required)
+    _require_space(root, required, "copy_snapshot")
     (root / "media").mkdir()
     (root / "manifest.json").write_bytes(manifest)
     _copy_bounded(bundle.transcript, root / "_chat.txt", transcript_size, lambda: progress("copy_text", 0, 0))
+    by_media = {r["media"]: r for r in bundle.data["records"] if r.get("media")}
     for i, item in enumerate(bundle.data["media"], 1):
         path = bundle.media_path(item)
         progress("copy", i, len(bundle.data["media"]))
@@ -1131,4 +1261,6 @@ def copy_package(bundle, root, progress):
             root / "media" / path.name,
             item["size"],
             lambda i=i: progress("copy", i, len(bundle.data["media"])),
+            file=item["name"],
+            record=by_media.get(item["name"]),
         )

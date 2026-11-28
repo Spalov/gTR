@@ -38,6 +38,9 @@ ServiceClient::ServiceClient(QString root, QString python, QObject *parent)
     : QObject(parent), root_(std::move(root)), python_(std::move(python)) {
     startup_.setSingleShot(true);
     connect(&startup_, &QTimer::timeout, this, [this] { fail("HANDSHAKE_TIMEOUT"); });
+    inactivity_.setSingleShot(true);
+    inactivity_.setInterval(180000);
+    connect(&inactivity_, &QTimer::timeout, this, [this] { fail("IPC_TIMEOUT"); });
     connect(&process_, &QProcess::started, this, [this] {
         hello_ = write("hello", {});
         if (hello_ == 0)
@@ -84,6 +87,7 @@ void ServiceClient::start() {
 void ServiceClient::stop() {
     stopping_ = true;
     startup_.stop();
+    inactivity_.stop();
     if (process_.state() != QProcess::NotRunning) {
         process_.closeWriteChannel();
         if (!process_.waitForFinished(3500)) {
@@ -113,6 +117,7 @@ void ServiceClient::send(const QString &method, const QJsonObject &params, Compl
         return;
     }
     complete_ = std::move(complete);
+    inactivity_.start();
 }
 
 void ServiceClient::cancel() {
@@ -166,10 +171,12 @@ void ServiceClient::consume(const QByteArray &line) {
     } else if (id == cancel_) {
         cancel_ = 0;
     } else if (message.contains("event")) {
+        inactivity_.start();
         if (onProgress)
             onProgress(message["stage"].toString(), message["done"].toInteger(), message["total"].toInteger());
     } else {
         active_ = 0;
+        inactivity_.stop();
         auto done = std::exchange(complete_, {});
         if (done)
             done(error.isEmpty() ? result : failure, error);
@@ -182,6 +189,7 @@ void ServiceClient::fail(const QString &reason) {
     stopping_ = true;
     ready_ = false;
     startup_.stop();
+    inactivity_.stop();
     if (process_.state() != QProcess::NotRunning)
         process_.kill();
     active_ = 0;

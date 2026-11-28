@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from .account import Target
+from .faults import ImportFault
 from .journal import Endpoint, State, _terminal_unknown, timestamp
 from .model import RecoveryError
 
@@ -51,7 +52,7 @@ async def _check_empty(manager, target):
     if not isinstance(history, (types.messages.Messages, types.messages.MessagesSlice)):
         raise RecoveryError("Telegram не подтвердил пустую историю. Повторите проверку.")
     if history.messages or getattr(history, "count", 0):
-        raise RecoveryError(f"В истории аккаунта {manager.account.id} ещё есть сообщения.")
+        raise ImportFault("TEST_HISTORY_NOT_EMPTY", stage="verify_test_history")
     if history.messages != [] or getattr(history, "count", 0) != 0 or getattr(history, "inexact", False):
         raise RecoveryError("Telegram вернул неточный результат. Повторите проверку истории.")
 

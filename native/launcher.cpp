@@ -19,11 +19,14 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR arguments, int) {
     PROCESS_INFORMATION process{};
     if (!CreateProcessW(shell.c_str(), command.data(), nullptr, nullptr, FALSE, 0,
                         nullptr, root.c_str(), &startup, &process)) {
-        MessageBoxW(nullptr,
-                    L"Проверьте, что комплект gTR полностью распакован. "
-                    L"Прежний интерфейс доступен командой gTR.cmd classic.",
-                    L"gTR", MB_OK | MB_ICONERROR);
-        return 2;
+        const DWORD code = GetLastError();
+        const bool blocked = code == ERROR_INVALID_IMAGE_HASH || code == ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION;
+        if (std::wstring(arguments) != L"--health-check") {
+            const auto message = blocked ? L"Политика запуска Windows не разрешает запустить эту сборку gTR."
+                                         : L"Проверьте, что комплект gTR полностью распакован.";
+            MessageBoxW(nullptr, message, L"gTR", MB_OK | MB_ICONERROR);
+        }
+        return blocked ? 43 : 2;
     }
     CloseHandle(process.hThread);
     WaitForSingleObject(process.hProcess, INFINITE);

@@ -9,6 +9,7 @@ from .bindings import UNRESOLVED, requested_kind, wire_name
 from .faults import FAULTS, ImportFault
 from .filenames import display_name
 from .media_recovery import DOCUMENT_ATTRIBUTES, force_file, observed_media_kind
+from .package_errors import PACKAGE_ERRORS
 
 PART_KIB = 512
 READ_RETRY_CODES = {"TIMEOUT", "CONNECTION_LOST", "SERVER_FAILURE"}
@@ -44,7 +45,7 @@ def rpc_error(error: Exception) -> ImportFault:
         return ImportFault("PHONE_CODE_INVALID")
     if name in {"FILE_PARTS_INVALID", "FILE_TOO_BIG"}:
         return ImportFault("MEDIA_SIZE_LIMIT")
-    return ImportFault(next((key for key in (name, raw) if key in FAULTS), "RPC_REJECTED"))
+    return ImportFault(next((key for key in (name, raw) if key in FAULTS and key not in PACKAGE_ERRORS), "RPC_REJECTED"))
 
 
 async def request(awaitable, *, seconds=45, timed=True):
