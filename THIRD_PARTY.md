@@ -17,3 +17,7 @@ gTR использует немодифицированные пакеты Qt fo
 Для преобразований gTR вызывает отдельно установленный FFmpeg и FFprobe. Их бинарники, libx264, PyAV, Pillow и cryptography отсутствуют в Windows ZIP. FFmpeg по умолчанию LGPL. Флаг сборки --enable-gpl и поддержка libx264 меняют условия распространения на GPL. [FFmpeg Legal](https://ffmpeg.org/legal.html)
 
 Опциональный профиль исходников media использует PyAV под BSD-3-Clause на уровне исходного адаптера и Pillow по MIT-CMU. DLL из готовых wheel PyAV могут содержать FFmpeg с GPL-компонентами. Распространение таких wheel требует проверки их конфигурации и уведомлений. Архив GGE тестировался с cryptography из отдельной среды. Код cryptography доступен по Apache-2.0 или BSD-3-Clause. [Сборки FFmpeg для PyAV](https://github.com/PyAV-Org/pyav-ffmpeg) · [Pillow](https://github.com/python-pillow/Pillow/blob/main/LICENSE) · [cryptography](https://github.com/pyca/cryptography/blob/main/LICENSE)
+## gAssets Beta 7
+
+Установщик компилируется Inno Setup. GAU использует .NET Framework 4.8, Windows CNG и системные механизмы Windows. Генератор релизов вызывает установленный OpenSSL для подписи на стороне разработчика. Исполняемые файлы OpenSSL в комплект gAssets не входят. Релиз gTR сохраняет уведомления Python, Qt, Telethon и GGE, описанные ниже.
+

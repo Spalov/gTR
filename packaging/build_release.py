@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from hashlib import file_digest, sha256
 from importlib.metadata import distribution
 from pathlib import Path
@@ -47,6 +48,11 @@ PACKAGES = (
 )
 LOCAL_METADATA = {"direct_url.json", "INSTALLER", "RECORD", "REQUESTED"}
 QT_VERSION = "6.12.0"
+QT_PACKAGE = "runtime/Lib/site-packages/PySide6/"
+PORTABLE_PROGRAMS = ("gTR.exe", QT_PACKAGE + "gTR-shell.exe")
+APPLICATION_CONTROL_ERRORS = {577, 4551}
+APPLICATION_CONTROL_EXIT = 43
+NATIVE_TESTS = (("protocol-test.exe", "native-protocol"), ("native-integration-test.exe", "native-ui"))
 QT_RUNTIME = (
     ("bin/Qt6Multimedia.dll", "Qt6Multimedia.dll"),
     ("bin/Qt6MultimediaWidgets.dll", "Qt6MultimediaWidgets.dll"),
@@ -124,6 +130,25 @@ def app_files():
                 "BETA_6_TEST_PLAN.md",
                 "GGE_PROVENANCE.md",
                 "BETA_6_FIX_MEDIA.md",
+                "BETA_6_FIX_2_VALIDATION.md",
+                "ARCHIVE_EDITOR.md",
+                "SELECTION_MODEL.md",
+                "UNIFIED_SHELL.md",
+                "GAU_ARCHITECTURE.md",
+                "GASSETS_UPDATE_CENTER.md",
+                "GITHUB_CONNECTOR.md",
+                "RELEASE_CATALOG.md",
+                "UPDATE_METADATA.md",
+                "GSU_FORMAT.md",
+                "GSU_SECURITY.md",
+                "GSU_PACKAGING.md",
+                "RELEASE_BUILDER.md",
+                "INSTALLATION.md",
+                "TRANSACTIONAL_UPDATE.md",
+                "LEGACY_MIGRATION.md",
+                "BETA_7_TEST_PLAN.md",
+                "RELEASE_READINESS.md",
+                "BETA_7_VALIDATION.md",
             )
         ),
     ]
@@ -142,6 +167,14 @@ def source_archive(path):
         ROOT / "packaging/make_icon.py",
         ROOT / "packaging/smoke_release.py",
         ROOT / "packaging/audit_beta6.py",
+        ROOT / "packaging/audit_beta7.py",
+        ROOT / "packaging/gassets_release.py",
+        ROOT / "packaging/test_gassets.py",
+        *sorted((ROOT / "gassets").glob("*.cs")),
+        ROOT / "gassets/tests/GauTests.cs",
+        ROOT / "gassets/gAssets.exe.config",
+        ROOT / "gassets/app.manifest",
+        ROOT / "gassets/setup.iss",
         ROOT / "native/CMakeLists.txt",
         *ROOT.glob("native/*.cpp"),
         *ROOT.glob("native/*.hpp"),
@@ -217,27 +250,57 @@ def compile_launcher(target, compiler=None):
         )
 
 
-def sign_launcher(target, sign_tool, thumbprint, timestamp_url):
-    subprocess.run(
-        [
-            str(sign_tool),
-            "sign",
-            "/sha1",
-            thumbprint,
-            "/fd",
-            "SHA256",
-            "/tr",
-            timestamp_url,
-            "/td",
-            "SHA256",
-            str(target),
-        ],
-        check=True,
-    )
-    subprocess.run([str(sign_tool), "verify", "/pa", "/tw", str(target)], check=True)
+@dataclass(frozen=True)
+class Authenticode:
+    tool: Path
+    thumbprint: str
+    timestamp_url: str
+
+    @staticmethod
+    def add_options(parser):
+        parser.add_argument("--sign-tool", type=Path)
+        parser.add_argument("--certificate-thumbprint")
+        parser.add_argument("--timestamp-url")
+
+    @classmethod
+    def from_options(cls, parser, args):
+        values = (args.sign_tool, args.certificate_thumbprint, args.timestamp_url)
+        if all(value is None for value in values):
+            return None
+        if not all(values):
+            parser.error("Authenticode signing requires --sign-tool, --certificate-thumbprint and --timestamp-url.")
+        try:
+            url = urlsplit(args.timestamp_url)
+        except ValueError:
+            parser.error("Use an HTTP(S) RFC 3161 timestamp URL and a 40-character certificate thumbprint.")
+        if (
+            url.scheme not in {"http", "https"}
+            or not url.hostname
+            or url.username is not None
+            or any(character.isspace() or character == '"' for character in args.timestamp_url)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", args.certificate_thumbprint)
+        ):
+            parser.error("Use an HTTP(S) RFC 3161 timestamp URL and a 40-character certificate thumbprint.")
+        tool = args.sign_tool.resolve()
+        if not tool.is_file():
+            parser.error("SignTool was not found at the specified path.")
+        return cls(tool, args.certificate_thumbprint, args.timestamp_url)
+
+    def sign_command(self):
+        return [
+            str(self.tool), "sign", "/sha1", self.thumbprint,
+            "/fd", "SHA256", "/tr", self.timestamp_url, "/td", "SHA256",
+        ]
+
+    def sign(self, target):
+        subprocess.run([*self.sign_command(), str(target)], check=True)
+        self.verify(target)
+
+    def verify(self, target):
+        subprocess.run([str(self.tool), "verify", "/pa", "/tw", str(target)], check=True)
 
 
-def build_native(sdk, *, allow_blocked_test=False):
+def build_native(sdk, *, signing=None, allow_blocked_test=False):
     sdk = sdk.resolve()
     if not (sdk / "lib/cmake/Qt6/Qt6Config.cmake").is_file():
         raise SystemExit(f"Install Qt {QT_VERSION} MSVC x64 with Qt Multimedia or specify --qt-sdk.")
@@ -253,21 +316,33 @@ def build_native(sdk, *, allow_blocked_test=False):
         test_python = Path(sys.executable)
     subprocess.run(
         ["cmake", "-S", str(ROOT / "native"), "-B", str(work), "-G", "Visual Studio 17 2022", "-A", "x64",
-         f"-DCMAKE_PREFIX_PATH={sdk}", f"-DGTR_TEST_PYTHON={test_python}"],
+         "-DBUILD_TESTING=ON", f"-DCMAKE_PREFIX_PATH={sdk}", f"-DGTR_TEST_PYTHON={test_python}"],
         check=True,
     )
     subprocess.run(["cmake", "--build", str(work), "--config", "Release", "--parallel", "8"], check=True)
+    compiled = work / "Release"
+    if signing:
+        for executable, _ in NATIVE_TESTS:
+            signing.sign(compiled / executable)
+    selection = []
     if allow_blocked_test:
-        env = {**os.environ, "PATH": str(sdk / "bin") + os.pathsep + os.environ["PATH"]}
-        try:
-            subprocess.run([str(work / "Release/protocol-test.exe")], check=True, env=env)
-        except OSError as error:
-            if error.winerror != 4551:
-                raise
-            print("Windows Application Control (4551) blocked the C++ test. Native runtime remains unverified.")
-            return work / "Release"
-    subprocess.run(["ctest", "--test-dir", str(work), "-C", "Release", "--output-on-failure"], check=True)
-    return work / "Release"
+        env = {**os.environ, "PATH": str(sdk / "bin") + os.pathsep + os.environ["PATH"],
+               "QT_QPA_PLATFORM": "offscreen"}
+        for executable, pattern in NATIVE_TESTS:
+            try:
+                subprocess.run([str(compiled / executable)], check=False, env=env, capture_output=True, timeout=12)
+            except OSError as error:
+                windows_error = getattr(error, "winerror", None)
+                if windows_error not in APPLICATION_CONTROL_ERRORS:
+                    raise
+                print(f"Windows Application Control ({windows_error}) blocked {executable}. Its runtime checks remain pending.")
+            else:
+                selection.append(pattern)
+    if not allow_blocked_test or selection:
+        tests = ["-R", "|".join(selection)] if allow_blocked_test else []
+        subprocess.run(["ctest", "--test-dir", str(work), "-C", "Release", "--output-on-failure",
+                        "--no-tests=error", *tests], check=True)
+    return compiled
 
 
 def portable_archive(path, runtime, launcher=None, shell=None, sdk=None):
@@ -293,7 +368,7 @@ def portable_archive(path, runtime, launcher=None, shell=None, sdk=None):
         if launcher:
             archive_file(package, "gTR.exe", launcher)
         if shell:
-            qt = "runtime/Lib/site-packages/PySide6/"
+            qt = QT_PACKAGE
             archive_file(package, qt + "gTR-shell.exe", shell)
             archive_entry(package, qt + "qt.conf", io.BytesIO(b"[Paths]\nPrefix=.\nPlugins=plugins\nTranslations=translations\n"))
             for source, name in QT_RUNTIME:
@@ -331,6 +406,27 @@ def portable_archive(path, runtime, launcher=None, shell=None, sdk=None):
                 file = Path(entry.locate())
                 if file.is_file():
                     archive_file(package, "runtime/Lib/site-packages/" + entry.as_posix(), file)
+
+
+def verify_packaged_launch(portable):
+    """Start the launcher from the newly built ZIP with an isolated local profile."""
+    with TemporaryDirectory(prefix="launch-check-", dir=portable.parent) as scratch:
+        isolated = Path(scratch)
+        with ZipFile(portable) as package:
+            package.extractall(isolated)
+        folder = isolated / NAME
+        env = {**os.environ, "LOCALAPPDATA": str(isolated / "profile"), "QT_QPA_PLATFORM": "windows"}
+        try:
+            result = subprocess.run([str(folder / "gTR.exe"), "--health-check"], cwd=folder,
+                                    env=env, check=False, timeout=45)
+        except OSError as error:
+            if getattr(error, "winerror", None) not in APPLICATION_CONTROL_ERRORS:
+                raise
+            raise SystemExit("Windows Application Control blocked gTR.exe in the staged ZIP.") from None
+        if result.returncode == APPLICATION_CONTROL_EXIT:
+            raise SystemExit("Windows Application Control blocked gTR-shell.exe in the staged ZIP.")
+        result.check_returncode()
+        print("Packaged gTR launched and the isolated engine check passed.")
 
 
 def source_patch(baseline, source, output):
@@ -377,42 +473,35 @@ if __name__ == "__main__":
     parser.add_argument("--python-embed", type=Path, default=ROOT / "build" / EMBED)
     parser.add_argument("--baseline-source", type=Path, help="Create a patch against the specified legacy ZIP")
     parser.add_argument("--archives-only", action="store_true", help="Build ZIPs without generating a baseline patch")
+    parser.add_argument("--output-dir", type=Path, default=RELEASE)
     parser.add_argument("--without-exe", action="store_true")
     parser.add_argument("--qt-sdk", type=Path, default=Path(os.environ.get("GTR_QT_SDK") or ROOT / "build/beta6-qt-sdk"))
     parser.add_argument("--allow-blocked-native-test", action="store_true",
                         help="Build local archives if Windows Application Control blocks the test executable")
-    parser.add_argument("--sign-tool", type=Path)
-    parser.add_argument("--certificate-thumbprint")
-    parser.add_argument("--timestamp-url")
+    Authenticode.add_options(parser)
     args = parser.parse_args()
     make_patch = args.baseline_source is not None and not args.archives_only and not args.portable_only
-    signing = (args.sign_tool, args.certificate_thumbprint, args.timestamp_url)
-    if any(signing):
-        if not all(signing) or args.source_only or args.without_exe:
-            parser.error("Signing requires all three signing options and a Windows launcher build.")
-        url = urlsplit(args.timestamp_url)
-        if (
-            url.scheme != "https"
-            or not url.hostname
-            or url.username is not None
-            or not re.fullmatch(r"[0-9a-fA-F]{40}", args.certificate_thumbprint)
-        ):
-            parser.error("Use an HTTPS timestamp service and a 40-character certificate thumbprint.")
-    RELEASE.mkdir(exist_ok=True)
-    with TemporaryDirectory(dir=RELEASE) as tmp:
+    signing = Authenticode.from_options(parser, args)
+    if signing and (args.source_only or args.without_exe):
+        parser.error("Authenticode signing requires a Windows launcher build.")
+    output = args.output_dir.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=output) as tmp:
         if not args.source_only:
             portable = Path(tmp) / f"{NAME}-Windows-x64.zip"
             launcher = Path(tmp) / "gTR.exe" if not args.without_exe else None
             shell = None
             if launcher:
-                compiled = build_native(args.qt_sdk, allow_blocked_test=args.allow_blocked_native_test)
+                compiled = build_native(args.qt_sdk, signing=signing, allow_blocked_test=args.allow_blocked_native_test)
                 shutil.copyfile(compiled / "gTR.exe", launcher)
                 shell = Path(tmp) / "gTR-shell.exe"
                 shutil.copyfile(compiled / "gTR-shell.exe", shell)
-                if all(signing):
-                    sign_launcher(launcher, *signing)
-                    sign_launcher(shell, *signing)
+                if signing:
+                    signing.sign(launcher)
+                    signing.sign(shell)
             portable_archive(portable, args.python_embed, launcher, shell, args.qt_sdk)
+            if signing:
+                verify_packaged_launch(portable)
         if not args.portable_only:
             source = Path(tmp) / f"{NAME}-source.zip"
             source_archive(source)
@@ -420,11 +509,11 @@ if __name__ == "__main__":
                 patch = Path(tmp) / f"{NAME}.patch"
                 source_patch(args.baseline_source, source, patch)
         if not args.source_only:
-            portable.replace(RELEASE / portable.name)
+            portable.replace(output / portable.name)
         if not args.portable_only:
-            source.replace(RELEASE / source.name)
+            source.replace(output / source.name)
             if make_patch:
-                patch.replace(RELEASE / patch.name)
+                patch.replace(output / patch.name)
         sums = Path(tmp) / f"{NAME}-SHA256SUMS.txt"
-        checksums(RELEASE, sums, include_patch=make_patch)
-        sums.replace(RELEASE / sums.name)
+        checksums(output, sums, include_patch=make_patch)
+        sums.replace(output / sums.name)

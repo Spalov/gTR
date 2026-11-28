@@ -30,7 +30,7 @@ from .model import RecoveryError, quiet
 from .owner import app_home
 
 OFFICIAL_REPOSITORY = "Spalov/gTR"
-RELEASE_PATTERN = r"gTR-Beta-([1-9][0-9]{0,4})(-Fix)?"
+RELEASE_PATTERN = r"gTR-Beta-([1-9][0-9]{0,4})(-Fix(?:-([2-9]|[1-9][0-9]{1,3}))?)?"
 ARCHIVE = re.compile(RELEASE_PATTERN + r"-Windows-x64\.zip")
 FOLDER = re.compile(RELEASE_PATTERN)
 SHA256 = re.compile(r"[a-f0-9]{64}")
@@ -46,7 +46,7 @@ REQUIRED = ("gTR.cmd", "gtr/__init__.py", "runtime/pythonw.exe", "runtime/python
 class Update:
     path: Path
     number: int
-    fix: bool = False
+    fix: int = 0
 
     @property
     def version(self):
@@ -95,11 +95,15 @@ def _current_version(current):
     return (current, False) if isinstance(current, int) else current
 
 
+def _release_version(match):
+    return int(match[1]), int(match[3]) if match[3] else int(bool(match[2]))
+
+
 def candidate(path, current=BETA_VERSION):
     path = local(Path(path))
     match = ARCHIVE.fullmatch(path.name)
     if match and path.is_file() and 0 < path.stat().st_size <= MAX_ARCHIVE:
-        update = Update(path, int(match[1]), bool(match[2]))
+        update = Update(path, *_release_version(match))
         if update.version > _current_version(current):
             return update
     raise RecoveryError("Выберите скачанный ZIP более нового выпуска gTR Beta.")
@@ -238,7 +242,8 @@ def install(update, progress=quiet, *, current=BETA_VERSION):
             with new_directory(dest) as work:
                 _extract(copy, work, dest.name, progress)
                 with (work / RECEIPT).open("x", encoding="ascii") as output:
-                    json.dump({"beta": update.number, "fix": update.fix, "sha256": digest}, output)
+                    fix = bool(update.fix) if update.fix < 2 else update.fix
+                    json.dump({"beta": update.number, "fix": fix, "sha256": digest}, output)
     except (OSError, BadZipFile, RuntimeError, ValueError):
         raise RecoveryError(
             "Не удалось установить обновление. Проверьте свободное место и целостность архива."
@@ -254,7 +259,7 @@ def installed_update(current=BETA_VERSION):
             match = FOLDER.fullmatch(folder.name)
             if not match:
                 continue
-            version = int(match[1]), bool(match[2])
+            version = _release_version(match)
             if version <= current:
                 continue
             try:
@@ -265,7 +270,8 @@ def installed_update(current=BETA_VERSION):
                     data = json.loads(marker.read(256))
                 if type(data["beta"]) is not int or data["beta"] != version[0]:
                     continue
-                if data.get("fix", False) is not version[1]:
+                fix = data.get("fix", False)
+                if type(fix) not in (bool, int) or int(fix) != version[1]:
                     continue
                 if not SHA256.fullmatch(data["sha256"]):
                     continue

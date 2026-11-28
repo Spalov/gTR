@@ -303,9 +303,7 @@ class AccountManager:
             user = next((u for u in getattr(contacts, "users", ()) if u.id == user_id), None)
             target = await self._target(user) if user is not None else None
             if target is None or target.id != user_id or target.kind != "pm":
-                raise RecoveryError(
-                    "Не удалось открыть тестовый диалог. Проверьте, что второй аккаунт доступен в контактах Telegram."
-                ) from None
+                raise ImportFault("SAVED_DIALOG_UNAVAILABLE", stage="resolve_target") from None
             return target
         if not isinstance(peer, types.InputPeerUser) or peer.user_id != user_id:
             raise RecoveryError("Telegram вернул другой диалог. Тестовый сброс остановлен.")

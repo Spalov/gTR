@@ -544,7 +544,8 @@ def recovery_root(journal, sha):
 
 
 def retain(journal, bundle, project=None, progress=quiet):
-    from .conversion import copy_package, load_bundle
+    from .conversion import Bundle, copy_package, load_bundle
+    from .package_errors import PackageValidationError
 
     sha = bundle.manifest_hash()
     root = recovery_root(journal, sha)
@@ -552,17 +553,31 @@ def retain(journal, bundle, project=None, progress=quiet):
         try:
             with new_directory(root) as work:
                 copy_package(bundle, work, progress)
-                if load_bundle(work, progress).manifest_hash() != sha:
-                    raise RecoveryError("Не удалось сверить сохранённую копию пакета.")
+                checked = load_bundle(work, progress)
+                actual = checked.manifest_hash()
+                if actual != sha:
+                    raise PackageValidationError("MANIFEST_MISMATCH", "copy_snapshot", "manifest_sha256",
+                                                 file="manifest.json", expected=sha, actual=actual)
                 from .reports import package_html
 
                 (work / "report.html").write_text(package_html(bundle.data), encoding="utf-8")
-        except (FileExistsError, RecoveryError, OSError):
+            saved = Bundle(root, checked.data)
+        except Cancelled:
+            raise
+        except (RecoveryError, OSError) as error:
             if not root.is_dir():
-                raise
-    saved = load_bundle(root, progress)
-    if saved.manifest_hash() != sha:
-        raise RecoveryError("Сохранённая копия пакета изменилась.")
+                if isinstance(error, PackageValidationError):
+                    raise
+                raise PackageValidationError("PACKAGE_IO_ERROR", "copy_snapshot", "recovery",
+                                             file="recovery", expected="доступная папка хранилища",
+                                             actual=getattr(error, "winerror", None) or getattr(error, "errno", None)) from None
+            saved = load_bundle(root, progress)
+    else:
+        saved = load_bundle(root, progress)
+    actual = saved.manifest_hash()
+    if actual != sha:
+        raise PackageValidationError("MANIFEST_MISMATCH", "copy_snapshot", "manifest_sha256",
+                                     file="manifest.json", expected=sha, actual=actual)
     archive = ""
     if project:
         from .core import catalogue, properties

@@ -8,6 +8,7 @@
 #include <QListView>
 #include <QListWidget>
 #include <QMessageBox>
+#include <QPixmap>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSettings>
@@ -127,6 +128,11 @@ int main(int argc, char **argv) {
                 std::cerr << "Page " << index << ", content " << scroll->widget()->width()
                           << ", viewport " << scroll->viewport()->width() << '\n';
             return fail("Native page is clipped horizontally");
+        }
+        if (index == 1 && width == 1366 && scale == 1) {
+            const auto screenshot = qEnvironmentVariable("GTR_NATIVE_TEST_SCREENSHOT");
+            if (!screenshot.isEmpty() && !window.grab().save(screenshot, "PNG"))
+                return fail("Unable to save the requested synthetic screenshot");
         }
     }
     if (!waitFor([&] { return pages->isEnabled(); }))

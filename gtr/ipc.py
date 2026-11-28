@@ -1,4 +1,4 @@
-"""Version 1 of the local recovery service. Only the parent owns the pipes."""
+"""Local recovery service over inherited pipes."""
 
 import json
 import os
@@ -12,21 +12,23 @@ from threading import Event, Lock, Thread
 from time import monotonic
 from uuid import uuid4
 
-from . import __version__
-from .bindings import AttachmentBindingError
+from . import __version__, editor
 from .conversion import load_bundle, plan_import, prepare
 from .core import analyze, catalogue, summary
+from .faults import ImportFault
 from .filenames import safe_filename
 from .files import is_link, local, safe_parts
 from .integrity import check_local
+from .journal import RecoveryRequired
 from .media_engine import PICTURE_TYPES, inspect
 from .media_queue import MediaDecisionRequired, MediaDiskSpace, cache_info, clean_cache
 from .model import Cancelled, RecoveryError
 from .owner import app_home, vault_path
+from .package_errors import PackageValidationError
 from .reports import plan_summary, redact_verification
 from .verification import compare_files
 
-VERSION = 1
+VERSION = 2
 MAX_FRAME = 1024 * 1024
 MAX_ID = 2**53 - 1
 PLAYABLE = {"video/mp4", "video/quicktime", "video/webm", "video/x-matroska", "video/x-msvideo",
@@ -174,6 +176,45 @@ def media_choices(entries):
     }
 
 
+def selection_args(params):
+    chat, preset = params["chat"], params.get("preset", "")
+    if not number(chat) or preset != "" and not string(preset, 80):
+        raise ProtocolError
+    return request_path(params["project"]), chat, preset
+
+
+def selection_page(params, progress):
+    before, limit = params.get("before"), params.get("limit", 50)
+    filters = params.get("filters", {})
+    if ((before is not None and not number(before)) or not number(limit, maximum=60)
+            or not isinstance(filters, dict)):
+        raise ProtocolError
+    try:
+        return editor.page(*selection_args(params), filters, progress, before, limit)
+    except (TypeError, ValueError) as error:
+        raise ProtocolError from error
+
+
+def selection_edit(params, progress):
+    revision, action = params["revision"], params["action"]
+    if not string(revision, 32) or not string(action, 16):
+        raise ProtocolError
+    filters = params.get("filters")
+    if filters is not None and not isinstance(filters, dict):
+        raise ProtocolError
+    try:
+        return editor.edit(*selection_args(params), revision, action, progress,
+                           ranges=params.get("ranges", ()), filters=filters,
+                           name=params.get("name", ""), note=params.get("note", ""))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ProtocolError from error
+
+
+def selection_preview(params, progress):
+    _, snapshot, stats = editor.review(*selection_args(params), progress)
+    return {"snapshot": snapshot, **stats}
+
+
 def recovery(params, progress, *, build=False):
     project = request_path(params["project"])
     chat = params["chat"]
@@ -193,15 +234,24 @@ def recovery(params, progress, *, build=False):
         "video_decisions": decisions, "annotate": notes != "local",
         "annotation_mode": notes, "annotation_language": language,
     }
+    selection = {}
+    if "preset" in params:
+        ranges, snapshot, stats = editor.review(*selection_args(params), progress)
+        options["record_ranges"] = ranges
+        selection = {"selection": stats, "snapshot": snapshot}
+        if build:
+            if params.get("snapshot") != snapshot:
+                raise editor.stale()
+            options["selection_snapshot"] = snapshot
     if build:
         if params.get("confirmed") is not True:
             raise ProtocolError
         out = local(app_home() / "packages" / uuid4().hex)
         bundle = prepare(project, chat, out, "source", progress, **options)
-        return {"path": str(bundle.root), "summary": plan_summary(bundle.data)}
+        return {"path": str(bundle.root), "manifest": bundle.manifest_hash(), "summary": plan_summary(bundle.data), **selection}
     plan = plan_import(project, chat, "source", progress, **options)
     pending = plan.get("media_decisions_required", [])
-    return {"summary": plan_summary(plan), **media_choices(pending)}
+    return {"summary": plan_summary(plan), **media_choices(pending), **selection}
 
 
 def prepare_recovery(params, progress):
@@ -217,6 +267,10 @@ def verify_package(params, progress):
     bundle = load_bundle(root, progress)
     if captures:
         result = compare_files(bundle, [request_path(path) for path in captures], project=project, progress=progress)
+        if params.get("reconcile") is True and len(captures) == 2:
+            from .cli import record_evidence
+
+            record_evidence(result)
         return redact_verification(result)
     result = check_local(bundle, project, progress)
     return {**result, "differences": result["differences"][:30]}
@@ -229,11 +283,38 @@ def operations(params, progress):
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA trusted_schema=OFF")
-        rows = db.execute(
-            """SELECT id,created,phase,state,messages,media,media_done,start_request_accepted
-               FROM operations WHERE mode='owner' ORDER BY rowid DESC LIMIT 100"""
-        ).fetchall()
+        try:
+            rows = db.execute(
+                """SELECT id,created,phase,state,messages,media,media_done,start_request_accepted
+                   FROM operations WHERE mode='owner' ORDER BY rowid DESC LIMIT 100"""
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Older databases may use pre-Beta column names. Migrate through the normal journal.
+            from .journal import Endpoint, Journal
+
+            Journal(database, Endpoint("local-review"))
+            rows = db.execute(
+                """SELECT id,created,phase,state,messages,media,media_done,start_request_accepted
+                   FROM operations WHERE mode='owner' ORDER BY rowid DESC LIMIT 100"""
+            ).fetchall()
     return {"operations": [dict(row) for row in rows]}
+
+
+def operation_report(params, progress):
+    from .headless_owner import operation_report as report
+
+    job = params["operation_id"]
+    if not string(job, 32) or type(params.get("private", False)) is not bool:
+        raise ProtocolError
+    return report(job, params.get("private", False))
+
+
+def operation_open(params, progress):
+    from .headless_owner import operation_open as open_retained
+
+    if not string(params["operation_id"], 32):
+        raise ProtocolError
+    return open_retained(params["operation_id"], progress)
 
 
 def media_inspect(params, progress):
@@ -341,16 +422,21 @@ def update_launch(params, progress):
     return {}
 
 
-RECOVERY_KEYS = {"media", "profile", "video", "notes", "language", "decisions", "first", "last"}
+RECOVERY_KEYS = {"media", "profile", "video", "notes", "language", "decisions", "first", "last", "preset"}
 METHODS = {
     "project.list": (recent_projects, set(), set()),
     "project.open": (open_project, {"project"}, set()),
     "archive.analyze": (archive_analyze, {"source"}, {"timezone", "format"}),
     "chat.page": (chat_page, {"project", "chat"}, {"query", "before", "limit"}),
+    "selection.page": (selection_page, {"project", "chat"}, {"preset", "filters", "before", "limit"}),
+    "selection.edit": (selection_edit, {"project", "chat", "revision", "action"}, {"preset", "ranges", "filters", "name", "note"}),
+    "selection.preview": (selection_preview, {"project", "chat"}, {"preset"}),
     "recovery.plan": (recovery, {"project", "chat"}, RECOVERY_KEYS),
-    "recovery.prepare": (prepare_recovery, {"project", "chat", "confirmed"}, RECOVERY_KEYS),
-    "verify.local": (verify_package, {"bundle"}, {"project", "captures"}),
+    "recovery.prepare": (prepare_recovery, {"project", "chat", "confirmed"}, RECOVERY_KEYS | {"snapshot"}),
+    "verify.local": (verify_package, {"bundle"}, {"project", "captures", "reconcile"}),
     "operation.list": (operations, set(), set()),
+    "operation.report": (operation_report, {"operation_id"}, {"private"}),
+    "operation.open": (operation_open, {"operation_id"}, set()),
     "media.inspect": (media_inspect, {"project", "asset"}, set()),
     "storage.info": (storage, set(), set()),
     "cache.clear": (clear_cache, {"confirmed"}, set()),
@@ -362,13 +448,18 @@ METHODS = {
 
 
 class Service:
-    def __init__(self, source, target):
+    def __init__(self, source, target, owner_factory=None):
+        from .headless_owner import OWNER_ROUTES, OwnerFlow
+
         self.source, self.target = source, target
         self.output = Lock()
         self.cancelled = Event()
         self.worker = None
         self.active = None
         self.ready = False
+        self.owner_factory = owner_factory or OwnerFlow
+        self.owner_routes = OWNER_ROUTES
+        self.owner_loop = None
 
     def send(self, request, **fields):
         packet = json.dumps({"v": VERSION, "id": request, **fields}, ensure_ascii=True, allow_nan=False).encode("ascii")
@@ -380,15 +471,20 @@ class Service:
 
     def dispatch(self, request, method, params):
         last = 0.0
+        previous_stage = ""
 
-        def progress(stage, done, total):
-            nonlocal last
+        def progress(stage, done, total, *, wait_seconds=None):
+            nonlocal last, previous_stage
             if self.cancelled.is_set():
                 raise Cancelled()
             now = monotonic()
-            if now - last >= 0.15:
-                self.send(request, event="progress", stage=stage, done=done, total=total)
-                last = now
+            if stage != previous_stage or wait_seconds is not None or now - last >= 0.15:
+                wait = {} if wait_seconds is None else {"wait_seconds": wait_seconds}
+                self.send(request, event="progress", stage=stage, done=done, total=total, **wait)
+                last, previous_stage = now, stage
+
+        progress.upload_wait = lambda seconds: progress("upload_file_parts", 0, 0, wait_seconds=seconds)
+        progress.upload_bytes = lambda event: progress("upload_bytes", event["sent"], event["size"])
 
         try:
             value = method(params, progress)
@@ -397,8 +493,19 @@ class Service:
             self.send(request, error={"code": "CANCELLED"})
         except ProtocolError:
             self.send(request, error={"code": "INVALID_PARAMS"})
-        except AttachmentBindingError:
-            self.send(request, error={"code": "UNRESOLVED_ATTACHMENT"})
+        except PackageValidationError as error:
+            self.send(request, error={"code": error.code, "package_issue": error.details(private=True)})
+        except ImportFault as error:
+            report = error.details(private=True)
+            report["component"] = "telegram"
+            if error.media_issues:
+                report.update(media_choices(error.media_issues))
+            self.send(request, error=report)
+        except RecoveryRequired as error:
+            review = error.review
+            self.send(request, error={"code": "REPLAY_BLOCKED", "eligible": review.eligible_count,
+                                      "confirmed": review.confirmed, "unknown": review.unknown,
+                                      "conflicts": [asdict(c) for c in review.conflicts[:60]]})
         except MediaDecisionRequired as error:
             self.send(request, error={"code": "MEDIA_DECISION_REQUIRED", "count": len(error.entries),
                                       **media_choices(error.entries)})
@@ -450,7 +557,7 @@ class Service:
                     if active:
                         self.cancelled.set()
                     self.send(request, result={"cancelling": active})
-                elif method not in METHODS:
+                elif method not in METHODS and method not in self.owner_routes:
                     self.send(request, error={"code": "UNKNOWN_METHOD"})
                 elif self.worker and self.worker.is_alive():
                     # The completed response may already be queued in the pipe while its thread exits.
@@ -465,10 +572,16 @@ class Service:
             self.cancelled.set()
             if self.worker:
                 self.worker.join(3)
+            if self.owner_loop:
+                self.owner_loop.close()
         return 0
 
     def start(self, request, method, params):
-        route, required, optional = METHODS[method]
+        if method in self.owner_routes:
+            required, optional = self.owner_routes[method]
+            route = lambda params, progress: self.call_owner(method, params, progress)
+        else:
+            route, required, optional = METHODS[method]
         if not required <= params.keys() <= required | optional:
             self.send(request, error={"code": "INVALID_PARAMS"})
             return
@@ -476,6 +589,13 @@ class Service:
         self.cancelled.clear()
         self.worker = Thread(target=self.dispatch, args=(request, route, params), daemon=True)
         self.worker.start()
+
+    def call_owner(self, method, params, progress):
+        from .headless_owner import OwnerLoop
+
+        if self.owner_loop is None:
+            self.owner_loop = OwnerLoop(self.owner_factory)
+        return self.owner_loop.run(method, params, progress, self.cancelled)
 
 
 if __name__ == "__main__":

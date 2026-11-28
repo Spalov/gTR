@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from .files import local
 from .model import RecoveryError
+from .package_errors import public_package_issue
 from .selection import (
     Intervals,
     count,
@@ -173,6 +174,7 @@ OPERATION_COLUMNS = {
     "selected_messages": "INTEGER",
     "validated_messages": "INTEGER NOT NULL DEFAULT 0",
     "accuracy": "TEXT",
+    "package_issue": "TEXT",
 }
 EVENT_COLUMNS = {"phase": "TEXT NOT NULL DEFAULT ''"}
 WORKER_COLUMNS = {"process_started_at": "TEXT NOT NULL DEFAULT ''", "disconnected_at": "TEXT"}
@@ -496,10 +498,7 @@ class Journal:
                 and prior["id"] == locked_id
                 and prior["mode"] == "owner"
                 and prior["pid"]
-                and prior["stage"] in PRE_START_STAGES
-                and prior["state"] in PRE_START_STATES
-                and not self._has_start_boundary(db, prior["id"])
-                and worker_stopped(prior)
+                and self._recovery_blocker(db, prior) is None
             )
             conflicts.append(
                 RecoveryConflict(
@@ -675,6 +674,23 @@ class Journal:
             register(db, job, bundle)
         return job
 
+    def record_invalid_package(self, fault, test_reset_id=None):
+        """Record a rejected preflight without registering records or reserving a destination."""
+        from . import __version__
+
+        job = uuid4().hex
+        with self.connect(lock=True) as db:
+            db.execute(
+                """INSERT INTO operations(id,created,peer,account,mode,fingerprint,scope,manifest_sha256,
+                   state,stage,messages,media,skipped,duplicates,error_code,phase,app_version,test_reset_id,package_issue)
+                   VALUES (?,?,?,?,'owner','','','',?,?,0,0,0,0,?,?,?,?,?)""",
+                (job, timestamp(), self.endpoint.key, self.endpoint.account_id, State.FAILED, fault.stage,
+                 fault.code, Phase.FAILED, __version__, test_reset_id,
+                 json.dumps(fault.package_issue, ensure_ascii=False)),
+            )
+            self._event(db, job, State.FAILED, fault.stage, 0, 0, fault.code)
+        return job
+
     def _event(self, db, job, state, stage, done, total, code):
         db.execute(
             "INSERT INTO operation_events(operation,ts,state,stage,done,total,code,phase) VALUES (?,?,?,?,?,?,?,?)",
@@ -770,6 +786,9 @@ class Journal:
                 ),
             )
             self._event(db, job, state, stage, done, total, code if fault else "")
+            if fault and getattr(fault, "package_issue", None):
+                db.execute("UPDATE operations SET package_issue=? WHERE id=?",
+                           (json.dumps(fault.package_issue, ensure_ascii=False), job))
 
     @staticmethod
     def _operation(row):
@@ -893,7 +912,7 @@ class Journal:
             "error_code",
             *(
                 OPERATION_COLUMNS.keys()
-                - {"content_fingerprint", "selection", "selected_messages", "validated_messages"}
+                - {"content_fingerprint", "selection", "selected_messages", "validated_messages", "package_issue"}
             ),
             "source_records",
             "package_records",
@@ -914,13 +933,17 @@ class Journal:
                 "content_fingerprint",
                 "selection",
             }
-        return {
+        report = {
             "schema": 1,
             "redacted": not private,
             "operation": {k: v for k, v in operation.items() if k in keys},
             "events": events,
             "media_attempts": attempts if private else list(map(redact_attempt, attempts)),
         }
+        if operation["package_issue"]:
+            issue = json.loads(operation["package_issue"])
+            report["package_issue"] = issue if private else public_package_issue(issue)
+        return report
 
     def events(self, job: str) -> list[dict]:
         with self.connect() as db:
@@ -968,6 +991,29 @@ class Journal:
                 )
                 self._event(db, row["id"], state, row["stage"], 0, 0, "PROCESS_INTERRUPTED")
 
+    def _recovery_blocker(self, db, row) -> str | None:
+        if not row or row["stage"] not in PRE_START_STAGES or row["state"] not in PRE_START_STATES:
+            return "Эта операция не подходит для локального восстановления до запуска."
+        if row["start_request_sent"] != 0 or row["start_request_accepted"] != 0 or self._has_start_boundary(db, row["id"]):
+            return "Финальный запрос мог быть отправлен. Нужна сверка истории."
+        if not worker_stopped(row):
+            return "Процесс операции ещё работает или его завершение не подтверждено."
+        return None
+
+    def recoverable_preparation(self) -> dict | None:
+        """Preview the stopped preparation for the connected account and dialog."""
+        with self.connect() as db:
+            row = db.execute(
+                """SELECT o.id,o.stage,o.state,o.start_request_sent,o.start_request_accepted,o.media,o.media_done,
+                   w.pid,w.process_started_at,w.disconnected_at FROM destination_locks l
+                JOIN operations o ON l.operation=o.id JOIN operation_workers w ON w.operation=o.id
+                WHERE l.peer=? AND o.peer=l.peer AND o.account IS ? AND o.mode='owner'""",
+                (self.endpoint.key, self.endpoint.account_id),
+            ).fetchone()
+            if self._recovery_blocker(db, row) is None:
+                return {"operation_id": row["id"], "media": row["media"], "media_done": row["media_done"]}
+        return None
+
     def recover_before_start(self, job: str, *, acknowledged=False) -> str:
         """Clear a stale local lock only when the durable final boundary was never reached."""
         if acknowledged is not True:
@@ -976,18 +1022,14 @@ class Journal:
             )
         with self.connect(lock=True) as db:
             row = db.execute(
-                """SELECT o.stage,o.state,o.start_request_sent,o.start_request_accepted,
+                """SELECT o.id,o.stage,o.state,o.start_request_sent,o.start_request_accepted,
                    w.pid,w.process_started_at,w.disconnected_at FROM operations o
                 JOIN destination_locks l ON l.operation=o.id JOIN operation_workers w ON w.operation=o.id
                 WHERE o.id=? AND o.mode='owner'""",
                 (job,),
             ).fetchone()
-            if not row or row["stage"] not in PRE_START_STAGES or row["state"] not in PRE_START_STATES:
-                raise RecoveryError("Эта операция не подходит для локального восстановления до запуска.")
-            if row["start_request_sent"] != 0 or row["start_request_accepted"] != 0 or self._has_start_boundary(db, job):
-                raise RecoveryError("Финальный запрос мог быть отправлен. Нужна сверка истории.")
-            if not worker_stopped(row):
-                raise RecoveryError("Процесс операции ещё работает или его завершение не подтверждено.")
+            if problem := self._recovery_blocker(db, row):
+                raise RecoveryError(problem)
             db.execute(
                 "UPDATE operations SET state=?,stage=?,outcome=?,phase=? WHERE id=?",
                 (State.STAGED_NOT_STARTED, "recovered_before_start", "staged_closed", Phase.PARTIAL, job),

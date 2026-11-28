@@ -2,14 +2,18 @@ import json
 import subprocess
 import sys
 from contextlib import contextmanager
+from io import BytesIO
 from queue import Queue
 from threading import Thread
+from types import SimpleNamespace
 
 from conftest import message, write_json
 
 from gtr.files import digest
 from gtr.fixtures import _png
-from gtr.ipc import MAX_FRAME, VERSION
+from gtr.ipc import MAX_FRAME, VERSION, Service
+from gtr.mock_api import offline_result
+from gtr.mtproto import PART_KIB, TelegramAPI
 
 
 @contextmanager
@@ -124,6 +128,45 @@ def test_ipc_rejects_duplicate_keys_and_limits_frames():
         worker.stdin.flush()
         assert packets.get(timeout=10)["error"]["code"] == "FRAME_LIMIT"
         assert worker.wait(timeout=10) == 2
+
+
+def test_large_file_upload_reports_deadline_and_bytes_through_ipc(monkeypatch):
+    size = 93_490_660
+
+    async def bounded_upload(awaitable, seconds):
+        assert seconds == 833
+        return await awaitable
+
+    monkeypatch.setattr("gtr.mtproto.asyncio.wait_for", bounded_upload)
+
+    class FakeUpload:
+        async def upload_file(self, path, *, file_name, part_size_kb, progress_callback):
+            assert file_name == "synthetic.mp4" and part_size_kb == PART_KIB
+            progress_callback(size // 2, size)
+            return "uploaded"
+
+    client = TelegramAPI(FakeUpload(), "pm", timed=True)
+    output = BytesIO()
+    engine = Service(BytesIO(), output)
+
+    def transfer(_, progress):
+        progress("upload_item", 48, 218)
+
+        def report(sent, total):
+            progress.upload_bytes({"sent": sent, "size": total, "name": "synthetic.mp4"})
+
+        file = SimpleNamespace(stat=lambda: SimpleNamespace(st_size=size))
+        assert offline_result(client.upload_file(file, "synthetic.mp4", report, wait=progress.upload_wait)) == "uploaded"
+        progress("bind_media", 48, 218)
+        return {}
+
+    engine.dispatch(1, transfer, {})
+    frames = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert [frame.get("stage") for frame in frames] == ["upload_item", "upload_file_parts", "upload_bytes", "bind_media", None]
+    assert frames[1]["wait_seconds"] == 833
+    assert (frames[2]["done"], frames[2]["total"]) == (size // 2, size)
+    assert b"synthetic.mp4" not in output.getvalue()
+    assert frames[-1]["result"] == {}
 
 
 def test_interrupted_worker_keeps_existing_project_and_can_restart(project, tmp_path):

@@ -11,6 +11,12 @@
 
 #include <utility>
 
+namespace {
+constexpr int inactivityMs = 180000;
+constexpr int transferGraceSeconds = 30;
+constexpr int cancellationGraceMs = 10000;
+}
+
 QByteArray requestFrame(qint64 id, const QString &method, const QJsonObject &params) {
     return QJsonDocument(QJsonObject{{"v", protocolVersion}, {"id", id}, {"method", method}, {"params", params}})
         .toJson(QJsonDocument::Compact) + '\n';
@@ -31,6 +37,11 @@ QJsonObject responseFrame(const QByteArray &line) {
     const bool failure = value["error"].isObject() && value["error"].toObject()["code"].isString();
     const bool progress = value["event"].toString() == "progress" && value["stage"].isString()
         && value["done"].isDouble() && value["total"].isDouble();
+    if (value.contains("wait_seconds")) {
+        const int wait = value["wait_seconds"].toInt();
+        if (!progress || value["stage"].toString() != "upload_file_parts" || wait < 1 || wait > 3600)
+            return {};
+    }
     return static_cast<int>(result) + static_cast<int>(failure) + static_cast<int>(progress) == 1 ? value : QJsonObject{};
 }
 
@@ -38,6 +49,17 @@ ServiceClient::ServiceClient(QString root, QString python, QObject *parent)
     : QObject(parent), root_(std::move(root)), python_(std::move(python)) {
     startup_.setSingleShot(true);
     connect(&startup_, &QTimer::timeout, this, [this] { fail("HANDSHAKE_TIMEOUT"); });
+    inactivity_.setSingleShot(true);
+    inactivity_.setTimerType(Qt::PreciseTimer);
+    connect(&inactivity_, &QTimer::timeout, this, [this] {
+        if (!timingOut_ && active_) {
+            timingOut_ = true;
+            cancel();
+            inactivity_.start(cancellationGraceMs);
+        } else {
+            fail("IPC_TIMEOUT");
+        }
+    });
     connect(&process_, &QProcess::started, this, [this] {
         hello_ = write("hello", {});
         if (hello_ == 0)
@@ -84,6 +106,7 @@ void ServiceClient::start() {
 void ServiceClient::stop() {
     stopping_ = true;
     startup_.stop();
+    inactivity_.stop();
     if (process_.state() != QProcess::NotRunning) {
         process_.closeWriteChannel();
         if (!process_.waitForFinished(3500)) {
@@ -113,6 +136,9 @@ void ServiceClient::send(const QString &method, const QJsonObject &params, Compl
         return;
     }
     complete_ = std::move(complete);
+    lastProgress_ = {};
+    timingOut_ = waitingForTransfer_ = false;
+    inactivity_.start(inactivityMs);
 }
 
 void ServiceClient::cancel() {
@@ -166,13 +192,27 @@ void ServiceClient::consume(const QByteArray &line) {
     } else if (id == cancel_) {
         cancel_ = 0;
     } else if (message.contains("event")) {
+        const auto stage = message["stage"].toString();
+        const auto done = message["done"].toInteger();
+        const auto total = message["total"].toInteger();
+        lastProgress_ = {{"stage", stage}, {"done", done}, {"total", total}};
+        if (!timingOut_ && (stage != "upload_bytes" || !waitingForTransfer_)) {
+            const auto wait = message["wait_seconds"].toInt();
+            waitingForTransfer_ = wait > 0;
+            inactivity_.start(qMax(inactivityMs, (wait + transferGraceSeconds) * 1000));
+        }
         if (onProgress)
-            onProgress(message["stage"].toString(), message["done"].toInteger(), message["total"].toInteger());
+            onProgress(stage, done, total);
     } else {
         active_ = 0;
+        inactivity_.stop();
         auto done = std::exchange(complete_, {});
-        if (done)
-            done(error.isEmpty() ? result : failure, error);
+        if (done) {
+            if (timingOut_ && error == "CANCELLED")
+                done({{"stage", lastProgress_.value("stage")}, {"progress", lastProgress_}}, "IPC_TIMEOUT");
+            else
+                done(error.isEmpty() ? result : failure, error);
+        }
     }
 }
 
@@ -182,12 +222,13 @@ void ServiceClient::fail(const QString &reason) {
     stopping_ = true;
     ready_ = false;
     startup_.stop();
+    inactivity_.stop();
     if (process_.state() != QProcess::NotRunning)
         process_.kill();
     active_ = 0;
     auto done = std::exchange(complete_, {});
     if (done)
-        done({}, reason);
+        done({{"stage", lastProgress_.value("stage")}, {"progress", lastProgress_}}, reason);
     if (onFailure)
         onFailure(reason);
 }

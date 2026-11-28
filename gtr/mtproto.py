@@ -9,6 +9,7 @@ from .bindings import UNRESOLVED, requested_kind, wire_name
 from .faults import FAULTS, ImportFault
 from .filenames import display_name
 from .media_recovery import DOCUMENT_ATTRIBUTES, force_file, observed_media_kind
+from .package_errors import PACKAGE_ERRORS
 
 PART_KIB = 512
 READ_RETRY_CODES = {"TIMEOUT", "CONNECTION_LOST", "SERVER_FAILURE"}
@@ -44,7 +45,7 @@ def rpc_error(error: Exception) -> ImportFault:
         return ImportFault("PHONE_CODE_INVALID")
     if name in {"FILE_PARTS_INVALID", "FILE_TOO_BIG"}:
         return ImportFault("MEDIA_SIZE_LIMIT")
-    return ImportFault(next((key for key in (name, raw) if key in FAULTS), "RPC_REJECTED"))
+    return ImportFault(next((key for key in (name, raw) if key in FAULTS and key not in PACKAGE_ERRORS), "RPC_REJECTED"))
 
 
 async def request(awaitable, *, seconds=45, timed=True):
@@ -95,18 +96,23 @@ class TelegramAPI:
                     return int(count) * PART_KIB * 1024
         return None
 
-    async def upload_file(self, path: Path, name: str, progress=None):
+    async def upload_file(self, path: Path, name: str, progress=None, *, wait=None):
         options = {"progress_callback": progress} if progress else {}
         if not self.timed:
             return await request(self.client.upload_file(str(path), file_name=name, **options), timed=False)
         # File-part requests have bounded time; a large file still has a finite total deadline.
         seconds = min(3600, max(120, 120 + path.stat().st_size // (128 * 1024)))
+        if wait is not None:
+            wait(seconds)
         return await request(
             self.client.upload_file(str(path), file_name=name, part_size_kb=PART_KIB, **options), seconds=seconds
         )
 
     async def upload_transcript(self, transcript):
         return await self.upload_file(transcript, "_chat.txt")
+
+    async def upload_transcript_traced(self, transcript, wait):
+        return await self.upload_file(transcript, "_chat.txt", wait=wait)
 
     async def initialize_uploaded(self, peer, file, media_count):
         result = await self.rpc(
@@ -174,7 +180,7 @@ class TelegramAPI:
                 report(name, sent, size, int(sent / max(now - started, 0.001)))
                 last = now
 
-        file = await self.upload_file(path, name, progress if report else None)
+        file = await self.upload_file(path, name, progress if report else None, wait=getattr(stage, "upload_wait", None))
         stage("build_input_media")
         if "wire_name" in item and getattr(file, "name", None) != name:
             raise ImportFault(UNRESOLVED)

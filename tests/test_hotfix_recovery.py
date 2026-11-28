@@ -219,13 +219,21 @@ def test_explicit_recovery_after_initialization_never_contacts_telegram(tmp_path
     restarted = Journal(path, endpoint)
     review = restarted.review_bundle(bundle)
     assert not review.conflicts[0].can_recover and review.eligible_count == 0
+    assert restarted.recoverable_preparation() is None
     with pytest.raises(RecoveryError, match="ещё работает"):
         restarted.recover_before_start(ready.operation_id, acknowledged=True)
     journal.owner_disconnected(ready.operation_id)
     assert restarted.review_bundle(bundle).conflicts[0].can_recover
+    assert restarted.recoverable_preparation() == {
+        "operation_id": ready.operation_id, "media": ready.media, "media_done": 0
+    }
+    assert Journal(path, Endpoint.telegram(101, 100, "pm")).recoverable_preparation() is None
+    attempts = restarted.media_attempts(ready.operation_id)
     restarted.recover_before_start(ready.operation_id, acknowledged=True)
     assert api.calls == before
     assert restarted.operation(ready.operation_id)["outcome"] == "staged_closed"
+    assert restarted.recoverable_preparation() is None
+    assert restarted.media_attempts(ready.operation_id) == attempts
     assert not restarted.review_bundle(bundle).conflicts
     _accept(restarted, bundle)
 
@@ -247,6 +255,7 @@ def test_uncertain_final_request_keeps_destination_locked_for_disjoint_records(t
 
     reopened = Journal(path, endpoint)
     reopened.classify_interrupted()
+    assert reopened.recoverable_preparation() is None
     review = reopened.review_bundle(disjoint)
     assert (review.overlap, review.confirmed, review.eligible_count, review.unknown) == (0, 0, 0, 2)
     assert review.conflicts[0].phase == Phase.UNKNOWN_SERVER_STATE and not review.conflicts[0].can_recover

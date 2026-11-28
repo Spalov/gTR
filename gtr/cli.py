@@ -16,6 +16,7 @@ from .journal import Endpoint, Journal
 from .media_queue import MediaDecisionRequired
 from .mock_api import SCENARIOS, rehearse
 from .model import RecoveryError, quiet
+from .package_errors import PackageValidationError
 from .reports import plan_summary, redact_verification, save_report
 from .verification import compare_files
 from .video import VIDEO_POLICIES, MediaTools
@@ -191,12 +192,11 @@ def main(argv=None):
             if updates.portable():
                 root = Path(sys.executable).parent.parent
                 shell = root / "runtime/Lib/site-packages/PySide6/gTR-shell.exe"
-                if shell.is_file():
-                    options = ["--project", str(local(args.project))] if getattr(args, "project", None) else []
-                    try:
-                        return subprocess.run([str(shell), *options], cwd=root, check=False).returncode
-                    except OSError:
-                        pass
+                options = ["--project", str(local(args.project))] if getattr(args, "project", None) else []
+                try:
+                    return subprocess.run([str(shell), *options], cwd=root, check=False).returncode
+                except OSError:
+                    raise RecoveryError("Оболочка C++ недоступна. Проверьте распаковку и политику запуска Windows.") from None
             from .gui import launch
 
             return launch(getattr(args, "project", None))
@@ -398,6 +398,9 @@ def main(argv=None):
         }, ensure_ascii=False), file=sys.stderr)
         return 2
     except ImportFault as fault:
+        print(json.dumps(fault.details(), ensure_ascii=False), file=sys.stderr)
+        return 2
+    except PackageValidationError as fault:
         print(json.dumps(fault.details(), ensure_ascii=False), file=sys.stderr)
         return 2
     except (RecoveryError, KeyboardInterrupt, EOFError) as exc:

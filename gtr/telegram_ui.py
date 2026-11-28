@@ -48,11 +48,18 @@ from .media_recovery import SERVER_MEDIA_ERRORS, server_issue
 from .model import Cancelled, RecoveryError
 from .observation import CaptureWindow
 from .owner import api_vault_path, journal_for, vault_path
+from .package_errors import PackageValidationError
 from .server import OwnerSession
 from .test_mode import ResetResult
 
 STAGES = {
     "local_check": "Проверка архива",
+    "load_manifest": "Чтение манифеста пакета",
+    "verify_media": "Проверка файлов и атрибутов вложений",
+    "verify_binding": "Проверка привязок вложений",
+    "copy_snapshot": "Сохранение защищённой копии",
+    "verify_before_start": "Сверка пакета перед отправкой",
+    "write_package": "Подготовка пакета",
     "inspect_media": "Проверка типов и метаданных вложений",
     "verify_text": "Сверка текста истории",
     "copy_text": "Копирование текста истории",
@@ -97,6 +104,14 @@ ACTION = {
     "test_password": "Двухэтапная проверка второго аккаунта",
     "test_cancel": "Отмена тестового сброса",
 }
+
+
+def package_error_text(issue):
+    fields = (("Этап", tr(STAGES.get(issue["stage"], issue["stage"]))),
+              ("ID сообщения", issue["source_id"]), ("Файл", issue["file"]), ("Поле", issue["field"]),
+              ("Ожидалось", issue["expected"]), ("Получено", issue["actual"]))
+    descriptions = [f"{tr(label_name)} · {value}" for label_name, value in fields if value is not None and value != ""]
+    return "\n".join((tr(issue["reason"]), *descriptions, tr(issue["action"])))
 
 
 def _button(text, action, primary=False):
@@ -672,7 +687,7 @@ class TelegramControls(QObject):
         self.baseline_button.setEnabled(observable)
         self.observe_button.setEnabled(observable)
         self.historical_button.setEnabled(observable)
-        self.diagnostic_button.setEnabled(bool(enabled and self.operation_id))
+        self.diagnostic_button.setEnabled(bool(enabled and (self.operation_id or self.last_fault)))
         self.repair_media_button.setVisible(bool(self.media_issues and self.package and self.project))
         self.repair_media_button.setEnabled(bool(enabled and self.media_issues and self.package and self.project))
         name = self.account.name if connected else tr("Аккаунт отключён.")
@@ -835,6 +850,7 @@ class TelegramControls(QObject):
         self.transcript_uploaded = self.start_sent = self.start_accepted = False
         self.observed = self.verified = None
         self.operation_id = None
+        self.last_fault = None
         self.media_issues, self.media_repair_job = [], None
 
     def set_package(self, bundle=None, project=None, source_path=""):
@@ -1122,8 +1138,8 @@ class TelegramControls(QObject):
             self.dispatch("observe", lambda session, p: session.observe(root, target, window, p))
 
     def export_diagnostic(self):
-        if self.operation_id:
-            self.window.save_operation_diagnostic(self.operation_id)
+        if self.operation_id or self.last_fault:
+            self.window.save_operation_diagnostic(self.operation_id, fallback=self.last_fault)
 
     def cancel(self):
         if self.thread:
@@ -1290,6 +1306,13 @@ class TelegramControls(QObject):
         if name in {"import", "preflight"}:
             self.review = None
             self.media_issues, self.media_repair_job = [], None
+        if isinstance(error, PackageValidationError):
+            error = ImportFault.from_package(error)
+        if isinstance(error, ImportFault):
+            self.last_fault = error
+        elif not isinstance(error, Cancelled):
+            self.last_fault = ImportFault("REPLAY_BLOCKED" if isinstance(error, RecoveryRequired) else "LOCAL_INVALID",
+                                          stage=ACTION.get(name, name))
         if name == "disconnect":
             self.account = self.review = None
             self.target.clear()
@@ -1327,14 +1350,15 @@ class TelegramControls(QObject):
                         self.media_repair_job = (journal_for(self.account, self.target.currentData()), self.operation_id)
                 self.state.setText(tr('Ошибка на вложении {0} из {1} · {2}').format(item['index'], item['total'], error.code))
                 self.details.setText(
-                    tr(
+                    package_error_text(error.package_issue) if error.package_issue else tr(
                         "{0} · Запись №{1} · ID сообщения {2}\nКласс {3} · MIME определён {4}, объявлен {5} · "
                         "{6} байт\n{7} Сохраните отчёт и изучите исходный файл перед подготовкой отдельного пакета."
                     ).format(item["name"], item["source_ordinal"], item["source_id"] or "—", item["input_media"],
                              item["detected_mime"] or "—", item["declared_mime"] or "—", number(item["size"]), action)
                 )
             else:
-                self.details.setText(f"{tr(STAGES.get(details['stage'], ACTION[name]))} · {action}")
+                self.details.setText(package_error_text(error.package_issue) if error.package_issue else
+                                     f"{tr(STAGES.get(details['stage'], ACTION[name]))} · {action}")
             self.log(f"Telegram · {tr(ACTION[name])} · {error.code}")
         else:
             self.errors += int(not isinstance(error, Cancelled))

@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .bindings import UNRESOLVED, AttachmentBindingError, requested_kind
-from .conversion import Bundle, load_bundle, owner_copy
+from .bindings import requested_kind
+from .conversion import Bundle, check_manifest_identity, load_bundle, owner_copy
 from .faults import AMBIGUOUS_RPC, FAULTS, RESTRICTIONS, UNSUPPORTED, ImportFault
 from .filenames import safe_filename
 from .journal import Journal, RecoveryRequired, State, safe_constructor, timestamp
@@ -18,6 +18,7 @@ from .media import KIND_NAMES
 from .media_engine import archive_paths, inspect_bundle
 from .media_recovery import bundle_issues, force_file, source_kind
 from .model import Cancelled, RecoveryError, quiet
+from .package_errors import PackageValidationError
 
 __all__ = ["FAULTS", "HistoryAPI", "ImportController", "ImportFault", "Journal", "Preflight", "run_import"]
 
@@ -142,18 +143,18 @@ class ImportController:
         self.close()
 
     def _problem(self, error, *, init_sent=False, staged=False, reserved=False):
-        if isinstance(error, AttachmentBindingError):
-            error = ImportFault(UNRESOLVED, stage=self.stage)
         cancelled = isinstance(error, (Cancelled, asyncio.CancelledError, KeyboardInterrupt))
         fault = (
-            error.at(self.stage)
+            ImportFault.from_package(error)
+            if isinstance(error, PackageValidationError)
+            else error.at(self.stage)
             if isinstance(error, ImportFault)
             else ImportFault(
                 "REPLAY_BLOCKED"
                 if isinstance(error, RecoveryRequired)
                 else "LOCAL_JOURNAL_UNAVAILABLE"
                 if isinstance(error, sqlite3.Error)
-                else "LOCAL_INVALID",
+                else "LOCAL_VALIDATION_FAILED",
                 stage=self.stage,
             )
         )
@@ -223,7 +224,9 @@ class ImportController:
                     bundle=bundle,
                 )
             if not bundle.data["included"]:
-                raise RecoveryError("В пакете нет сообщений для переноса.")
+                raise PackageValidationError("PACKAGE_SCHEMA_INVALID", "load_manifest", "included",
+                                             file="manifest.json", expected="не меньше 1", actual=0,
+                                             reason="В пакете нет сообщений для переноса.")
             if self.mode == "owner" and any(
                 bundle.data["losses"].get(key) for key in ("ordered_time", "synthetic_time")
             ):
@@ -231,16 +234,24 @@ class ImportController:
                     "Для отправки подготовьте пакет с исходными датами без сдвигов и подстановок."
                 )
             if self.mode == "owner":
+                from .editor import check_snapshot
+
+                check_snapshot(getattr(self, "source_project", None), bundle.data, self.progress)
+                check_manifest_identity(bundle, "copy_snapshot")
+            if self.mode == "owner" and self.journal:
+                from .incremental_import import retain
+
+                checked = retain(self.journal, bundle, getattr(self, "source_project", None), self.progress)
+            elif self.mode == "owner":
                 checked = self.files.enter_context(owner_copy(bundle, self.progress))
             else:
                 checked = load_bundle(bundle.root, self.progress)
-            if checked.manifest_hash() != bundle.manifest_hash():
-                raise RecoveryError("Пакет изменился после выбора. Откройте его снова.")
+            expected = bundle.manifest_hash()
+            actual = checked.manifest_hash()
+            if actual != expected:
+                raise PackageValidationError("MANIFEST_MISMATCH", "copy_snapshot", "manifest_sha256",
+                                             file="manifest.json", expected=expected, actual=actual)
             self.bundle = checked
-            if self.journal and self.mode == "owner":
-                from .incremental_import import retain
-
-                retain(self.journal, checked, getattr(self, "source_project", None), self.progress)
             if self.mode == "owner" and checked.data["media"]:
                 inventory = inspect_bundle(checked, self.progress, hash_verified=True)
                 self.media_facts = inventory["items"]
@@ -266,7 +277,11 @@ class ImportController:
                         self.journal.begin_media(self.job, attempt)
                         self.journal.finish_media(self.job, attempt)
                 if self.media_attempt:
-                    raise ImportFault("MEDIA_LOCAL_INVALID", stage="inspect_media")
+                    attempt = self.media_attempt
+                    issue = PackageValidationError("MEDIA_ATTRIBUTES_INVALID", "inspect_media", "representation",
+                                                   record=attempt, file=attempt["name"], expected=attempt["requested_kind"],
+                                                   actual=attempt["local_issue"])
+                    raise ImportFault("MEDIA_LOCAL_INVALID", stage="inspect_media", package_issue=issue.issue)
             self._advance(State.VALIDATING, "validated", checked.data["included"], checked.data["included"])
             self._advance(State.VALIDATING, "check_history")
             kind = await self.api.check_head(checked.head())
@@ -303,7 +318,7 @@ class ImportController:
                 fault = self._problem(error)
             finally:
                 self.close()
-            if isinstance(error, RecoveryError) and not isinstance(error, (ImportFault, AttachmentBindingError)):
+            if isinstance(error, RecoveryError) and not isinstance(error, (ImportFault, PackageValidationError)):
                 raise
             raise fault from None
 
@@ -316,6 +331,8 @@ class ImportController:
             self.journal.begin_media(self.job, attempt)
 
         def stage(name):
+            if name == "upload_imported_media":
+                self.progress("bind_media", index, total)
             attempt["stage"] = name
             if self.journal and self.job:
                 self.journal.media_stage(self.job, index, name)
@@ -329,6 +346,7 @@ class ImportController:
             stage.upload_bytes = lambda name, sent, size, speed: report(
                 {"name": name, "index": index, "total": total, "sent": sent, "size": size, "speed": speed}
             )
+        stage.upload_wait = getattr(self.progress, "upload_wait", None)
         try:
             self.progress("upload_item", index, total)
             path = bundle.media_path(item)
@@ -385,7 +403,13 @@ class ImportController:
                 bundle.fingerprint() != checked.fingerprint
                 or bundle.manifest_hash() != checked.manifest_sha256
             ):
-                raise RecoveryError("Пакет изменился после проверки. Откройте его снова.")
+                raise PackageValidationError("MANIFEST_MISMATCH", "verify_before_start", "manifest_sha256",
+                                             file="manifest.json", expected=checked.manifest_sha256,
+                                             actual=bundle.manifest_hash())
+            if self.mode == "owner":
+                from .editor import check_snapshot
+
+                check_snapshot(getattr(self, "source_project", None), bundle.data, self.progress)
             media = bundle.data["media"]
             source_records = {
                 record.get("media"): record for record in bundle.data["records"] if record.get("media")
@@ -396,7 +420,11 @@ class ImportController:
             upload_transcript = getattr(self.api, "upload_transcript", None)
             if upload_transcript:
                 self._advance(State.INITIALIZING, "upload_transcript")
-                file = await upload_transcript(bundle.transcript)
+                traced_transcript = getattr(self.api, "upload_transcript_traced", None)
+                if traced_transcript:
+                    file = await traced_transcript(bundle.transcript, getattr(self.progress, "upload_wait", None))
+                else:
+                    file = await upload_transcript(bundle.transcript)
                 self._advance(State.INITIALIZING, "transcript_uploaded", 1, 1, transcript_uploaded=True)
                 self._advance(State.INITIALIZING, "init_import", 0, len(media))
                 init_sent = True
@@ -448,7 +476,7 @@ class ImportController:
                 self.close()
             if (
                 isinstance(error, RecoveryError)
-                and not isinstance(error, ImportFault)
+                and not isinstance(error, (ImportFault, PackageValidationError))
                 and self.state != State.START_UNCERTAIN
             ):
                 raise
